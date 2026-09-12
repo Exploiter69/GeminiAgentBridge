@@ -24,7 +24,7 @@ class Phase2ProtocolTests(unittest.TestCase):
                     "additionalProperties": False,
                 },
             }
-        ]
+        }]
 
     def test_prompt_prefers_strict_sentinel_protocol(self):
         prompt, _ = tools.messages_to_prompt(
