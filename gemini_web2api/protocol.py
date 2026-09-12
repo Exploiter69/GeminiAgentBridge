@@ -1,69 +1,79 @@
-"""Robust tool-call protocol helpers for agent runtimes.
-
-Gemini Web does not expose native OpenAI tool calls, so the bridge uses a
-small textual protocol. This module deliberately accepts the legacy fenced
-format as well as the stricter sentinel format, while producing normalized
-OpenAI-style tool calls with deterministic IDs.
-"""
+"""Robust tool-call protocol helpers for agent runtimes."""
 from __future__ import annotations
 
 import hashlib
 import json
 import re
+import threading
 from typing import Any
 
+_SENTINEL_RE = re.compile(r"@@TOOL_CALL@@\s*(?P<body>.*?)\s*@@END_TOOL_CALL@@", re.DOTALL)
+_FENCED_RE = re.compile(r"```tool_call\s*(?:\n)?(?P<body>.*?)\s*```", re.DOTALL | re.IGNORECASE)
+_RAW_FUNCTION_RE = re.compile(r"(?:^|\n)tool_call\s*(?:\n)?(?P<body>\{.*?\})", re.DOTALL)
 
-_SENTINEL_RE = re.compile(
-    r"@@TOOL_CALL@@\s*(?P<body>.*?)\s*@@END_TOOL_CALL@@",
-    re.DOTALL,
-)
-_FENCED_RE = re.compile(
-    r"```tool_call\s*(?:\n)?(?P<body>.*?)\s*```",
-    re.DOTALL | re.IGNORECASE,
-)
-_RAW_FUNCTION_RE = re.compile(
-    r"(?:^|\n)tool_call\s*(?:\n)?(?P<body>\{.*?\})",
-    re.DOTALL,
+STRICT_TOOL_PROTOCOL = (
+    "# Strict Tool Use Protocol\n\n"
+    "When you need to call a tool, output ONLY the following exact block; do not use Markdown fences:\n"
+    "@@TOOL_CALL@@\n"
+    '{"name":"tool_name","arguments":{...}}\n'
+    "@@END_TOOL_CALL@@\n\n"
+    "Rules:\n"
+    "- Use exactly the tool name from Available tools.\n"
+    "- arguments MUST be a JSON object.\n"
+    "- Output valid JSON only inside the block.\n"
+    "- Do not put tool calls in normal prose.\n"
+    "- Do not repeat a tool call that has already been completed unless its arguments must genuinely be retried.\n"
+    "- You may emit multiple blocks when multiple independent tool calls are needed.\n"
 )
 
+_REPAIR_PREFIX = (
+    "# Tool Call Repair\n\n"
+    "Your previous response contained an invalid tool call. Correct it and retry.\n"
+    "Output ONLY the corrected @@TOOL_CALL@@ block(s), with no Markdown fences or prose.\n"
+)
 
-def _candidate_objects(text: str) -> list[tuple[int, str]]:
-    """Return protocol candidates in source order."""
-    found: list[tuple[int, str]] = []
+_tool_context = threading.local()
+
+def set_tool_context(tool_defs: list[dict[str, Any]] | None, tool_choice: Any = "auto") -> None:
+    _tool_context.tool_defs = tool_defs or []
+    _tool_context.tool_choice = tool_choice
+
+def get_tool_context() -> tuple[list[dict[str, Any]], Any]:
+    return getattr(_tool_context, "tool_defs", []), getattr(_tool_context, "tool_choice", "auto")
+
+def clear_tool_context() -> None:
+    for attr in ("tool_defs", "tool_choice"):
+        if hasattr(_tool_context, attr):
+            delattr(_tool_context, attr)
+
+def _candidate_objects(text: str) -> list[tuple[int, int, str]]:
+    found: list[tuple[int, int, str]] = []
     for pattern in (_SENTINEL_RE, _FENCED_RE, _RAW_FUNCTION_RE):
         for match in pattern.finditer(text):
-            found.append((match.start(), match.group("body")))
+            found.append((match.start(), match.end(), match.group("body")))
     found.sort(key=lambda item: item[0])
     return found
 
-
 def _decode_object(raw: str) -> dict[str, Any] | None:
-    """Decode one candidate, tolerating harmless surrounding whitespace."""
     raw = raw.strip()
     if not raw:
         return None
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError:
-        # Some models wrap a JSON object in prose. Extract the outermost
-        # object without attempting unsafe or lossy quote substitution.
-        start = raw.find("{")
-        end = raw.rfind("}")
+        start, end = raw.find("{"), raw.rfind("}")
         if start < 0 or end <= start:
             return None
         try:
-            obj = json.loads(raw[start : end + 1])
+            obj = json.loads(raw[start:end + 1])
         except json.JSONDecodeError:
             return None
     return obj if isinstance(obj, dict) else None
 
-
 def _normalize(obj: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
-    """Normalize legacy arguments/args forms and reject malformed calls."""
     name = obj.get("name")
     if not isinstance(name, str) or not name.strip():
         return None
-
     arguments = obj.get("arguments", obj.get("args", {}))
     if isinstance(arguments, str):
         try:
@@ -76,23 +86,13 @@ def _normalize(obj: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
         return None
     return name.strip(), arguments
 
-
 def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
-    """Parse tool calls and return clean assistant text plus OpenAI calls.
-
-    The parser is intentionally fail-closed: malformed candidates remain in
-    the assistant text instead of being silently turned into an invalid tool
-    invocation. Duplicate calls in one model response are removed from the
-    visible text while only the first occurrence is emitted as a tool call.
-    """
     if not text:
         return text or "", []
-
     calls: list[dict[str, Any]] = []
     spans: list[tuple[int, int]] = []
     seen: set[str] = set()
-
-    for start, raw in _candidate_objects(text):
+    for start, end, raw in _candidate_objects(text):
         obj = _decode_object(raw)
         if obj is None:
             continue
@@ -100,49 +100,87 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
         if normalized is None:
             continue
         name, arguments = normalized
-        canonical = json.dumps(
-            {"name": name, "arguments": arguments},
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-        # Every valid protocol block is removed from visible assistant text,
-        # including duplicates. Only the first occurrence is emitted.
-        removed = False
-        for pattern in (_SENTINEL_RE, _FENCED_RE, _RAW_FUNCTION_RE):
-            for match in pattern.finditer(text):
-                if match.start() == start:
-                    spans.append((match.start(), match.end()))
-                    removed = True
-                    break
-            if removed:
-                break
-
+        canonical = json.dumps({"name": name, "arguments": arguments}, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        spans.append((start, end))
         if canonical in seen:
             continue
         seen.add(canonical)
-
-        digest = hashlib.sha256(
-            f"{len(calls)}:{canonical}".encode("utf-8")
-        ).hexdigest()[:12]
-        calls.append(
-            {
-                "id": f"call_{digest}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(
-                        arguments, ensure_ascii=False, separators=(",", ":")
-                    ),
-                },
-            }
-        )
-
+        digest = hashlib.sha256(f"{len(calls)}:{canonical}".encode()).hexdigest()[:12]
+        calls.append({"id": f"call_{digest}", "type": "function", "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))}})
     if not spans:
         return text.strip(), calls
-
     clean = text
     for start, end in sorted(spans, reverse=True):
         clean = clean[:start] + clean[end:]
     return clean.strip(), calls
+
+def _schema_type_ok(value: Any, schema_type: str) -> bool:
+    return {
+        "object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "boolean": isinstance(value, bool), "null": value is None,
+    }.get(schema_type, True)
+
+def _validate_value(value: Any, schema: dict[str, Any], path: str) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(schema, dict):
+        return errors
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str) and not _schema_type_ok(value, schema_type):
+        return [f"{path}: expected {schema_type}"]
+    if "enum" in schema and value not in schema["enum"]:
+        errors.append(f"{path}: value is not allowed")
+    if isinstance(value, dict):
+        for key in schema.get("required", []):
+            if key not in value:
+                errors.append(f"{path}.{key}: required field is missing")
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            for key, item in value.items():
+                if key in properties:
+                    errors.extend(_validate_value(item, properties[key], f"{path}.{key}"))
+                elif schema.get("additionalProperties") is False:
+                    errors.append(f"{path}.{key}: unexpected field")
+    elif isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for i, item in enumerate(value):
+            errors.extend(_validate_value(item, schema["items"], f"{path}[{i}]"))
+    if isinstance(value, str) and isinstance(schema.get("minLength"), int) and len(value) < schema["minLength"]:
+        errors.append(f"{path}: string is too short")
+    return errors
+
+def _tool_def_map(tool_defs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    result = {}
+    for tool in tool_defs or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        if isinstance(fn.get("name"), str) and fn["name"]:
+            result[fn["name"]] = fn
+    return result
+
+def validate_tool_calls(tool_calls: list[dict[str, Any]], tool_defs: list[dict[str, Any]] | None = None) -> list[str]:
+    defs = _tool_def_map(tool_defs or [])
+    errors: list[str] = []
+    for index, call in enumerate(tool_calls):
+        fn = call.get("function", {})
+        name = fn.get("name")
+        if name not in defs:
+            errors.append(f"tool_calls[{index}]: unknown tool '{name}'")
+            continue
+        try:
+            arguments = json.loads(fn.get("arguments", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            errors.append(f"tool_calls[{index}].arguments: invalid JSON")
+            continue
+        if not isinstance(arguments, dict):
+            errors.append(f"tool_calls[{index}].arguments: expected object")
+            continue
+        errors.extend(_validate_value(arguments, defs[name].get("parameters", {}) or {}, f"tool_calls[{index}].arguments"))
+    return errors
+
+def response_needs_repair(text: str, tool_calls: list[dict[str, Any]], tool_defs: list[dict[str, Any]], tool_choice: Any = "auto") -> bool:
+    attempted = any(marker in (text or "") for marker in ("@@TOOL_CALL@@", "```tool_call", "\ntool_call\n"))
+    return (attempted and not tool_calls) or bool(validate_tool_calls(tool_calls, tool_defs)) or (tool_choice == "required" and not tool_calls)
+
+def build_repair_prompt(original_prompt: str, errors: list[str]) -> str:
+    details = "\n".join(f"- {error}" for error in errors[:8]) or "- tool call was not parseable"
+    return f"{original_prompt}\n\n{_REPAIR_PREFIX}{details}\n"
