@@ -82,8 +82,8 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
 
     The parser is intentionally fail-closed: malformed candidates remain in
     the assistant text instead of being silently turned into an invalid tool
-    invocation. Duplicate calls in one model response are removed while
-    preserving the first occurrence.
+    invocation. Duplicate calls in one model response are removed from the
+    visible text while only the first occurrence is emitted as a tool call.
     """
     if not text:
         return text or "", []
@@ -106,13 +106,9 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        if canonical in seen:
-            continue
-        seen.add(canonical)
 
-        # Locate the exact matching protocol block so it can be removed from
-        # visible assistant text. Prefer sentinel/fenced matches; raw calls
-        # use their candidate span as a conservative fallback.
+        # Every valid protocol block is removed from visible assistant text,
+        # including duplicates. Only the first occurrence is emitted.
         removed = False
         for pattern in (_SENTINEL_RE, _FENCED_RE, _RAW_FUNCTION_RE):
             for match in pattern.finditer(text):
@@ -122,6 +118,10 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
                     break
             if removed:
                 break
+
+        if canonical in seen:
+            continue
+        seen.add(canonical)
 
         digest = hashlib.sha256(
             f"{len(calls)}:{canonical}".encode("utf-8")
