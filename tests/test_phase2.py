@@ -1,11 +1,13 @@
+import http.client
 import json
+import threading
 import unittest
 from unittest import mock
 
-from gemini_web2api import _original_generate
 from gemini_web2api import protocol
-from gemini_web2api import tools
 from gemini_web2api import server
+from gemini_web2api import tools
+from gemini_web2api.config import CONFIG
 
 
 class Phase2ProtocolTests(unittest.TestCase):
@@ -22,7 +24,7 @@ class Phase2ProtocolTests(unittest.TestCase):
                     "additionalProperties": False,
                 },
             }
-        }]
+        ]
 
     def test_prompt_prefers_strict_sentinel_protocol(self):
         prompt, _ = tools.messages_to_prompt(
@@ -68,6 +70,46 @@ class Phase2ProtocolTests(unittest.TestCase):
         self.assertEqual(upstream.call_count, 2)
         self.assertIn("Tool Call Repair", upstream.call_args.args[0])
         protocol.clear_tool_context()
+
+    def test_chat_completion_returns_openai_tool_call_after_repair(self):
+        original_config = dict(CONFIG)
+        CONFIG["api_keys"] = []
+        bridge = server.ThreadedServer(("127.0.0.1", 0), server.GeminiHandler)
+        thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+        bridge.allow_reuse_address = True
+        thread.start()
+        try:
+            invalid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":123}}\n@@END_TOOL_CALL@@'
+            valid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":"pwd"}}\n@@END_TOOL_CALL@@'
+            with mock.patch("gemini_web2api._original_generate", side_effect=[invalid, valid]) as upstream:
+                connection = http.client.HTTPConnection("127.0.0.1", bridge.server_address[1], timeout=5)
+                connection.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    body=json.dumps({
+                        "model": "gemini-3.1-pro",
+                        "messages": [{"role": "user", "content": "run pwd"}],
+                        "tools": self.tools,
+                    }),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                body = json.loads(response.read().decode())
+                connection.close()
+
+            self.assertEqual(response.status, 200)
+            message = body["choices"][0]["message"]
+            self.assertIsNone(message["content"])
+            self.assertEqual(message["tool_calls"][0]["function"]["name"], "bash")
+            self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {"command": "pwd"})
+            self.assertEqual(upstream.call_count, 2)
+        finally:
+            bridge.shutdown()
+            bridge.server_close()
+            thread.join(timeout=5)
+            CONFIG.clear()
+            CONFIG.update(original_config)
+            protocol.clear_tool_context()
 
 
 if __name__ == "__main__":
