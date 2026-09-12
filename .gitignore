@@ -3,6 +3,8 @@ cookie.txt
 *.session-journal
 .env
 .env.*
+config.json
+config.local.json
 __pycache__/
 *.pyc
 .venv/
