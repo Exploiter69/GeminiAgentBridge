@@ -3,6 +3,7 @@ import unittest
 from gemini_web2api.context import compact_messages
 from gemini_web2api.grounding import GroundingFacts
 from gemini_web2api.observability import new_trace_id, request_summary, response_summary, safe_tool_names
+from gemini_web2api.tools import messages_to_prompt
 
 
 class GroundingContractTests(unittest.TestCase):
@@ -31,6 +32,14 @@ class GroundingContractTests(unittest.TestCase):
     def test_malformed_grounding_is_fail_closed(self):
         facts = GroundingFacts.from_request({"grounding": "guess me"})
         self.assertFalse(facts.is_explicit)
+
+    def test_prompt_builder_can_render_explicit_grounding(self):
+        facts = GroundingFacts(requested_cwd="/tmp/hermes-test", task_target="sample.txt")
+        prompt, _ = messages_to_prompt(
+            [{"role": "user", "content": "read the target"}], grounding=facts
+        )
+        self.assertIn("/tmp/hermes-test", prompt)
+        self.assertIn("sample.txt", prompt)
 
 
 class ContextBudgetTests(unittest.TestCase):
