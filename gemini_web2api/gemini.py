@@ -5,9 +5,11 @@ import uuid
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
 import ssl
 import os
 import hashlib
+import threading
 
 try:
     import httpx
@@ -16,10 +18,13 @@ except ImportError:
     HAS_HTTPX = False
 
 from .config import CONFIG
+from .performance import RetryPolicy
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+_cookie_lock = threading.Lock()
 _httpx_client = None
+_httpx_client_lock = threading.Lock()
 
 
 def log(msg: str):
@@ -39,10 +44,24 @@ def _get_ssl_ctx():
 def _get_httpx_client():
     global _httpx_client
     if _httpx_client is None and HAS_HTTPX:
-        proxy = CONFIG.get("proxy")
-        transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        with _httpx_client_lock:
+            if _httpx_client is None:
+                proxy = CONFIG.get("proxy")
+                transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+                _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
     return _httpx_client
+
+
+def _reset_httpx_client() -> None:
+    """Drop a stale transport so the next request creates a fresh client."""
+    global _httpx_client
+    with _httpx_client_lock:
+        client, _httpx_client = _httpx_client, None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 def load_cookie() -> tuple:
@@ -50,25 +69,26 @@ def load_cookie() -> tuple:
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
-    try:
-        mtime = os.path.getmtime(cookie_file)
-        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+    with _cookie_lock:
+        try:
+            mtime = os.path.getmtime(cookie_file)
+            if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
+                return _cookie_cache["str"], _cookie_cache["sapisid"]
+            with open(cookie_file, "r") as f:
+                content = f.read().strip()
+            if content.startswith("{"):
+                data = json.loads(content)
+                cookie_str = data.get("cookie", "")
+                sapisid = data.get("sapisid", "")
+            else:
+                cookie_str = content
+                pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
+                sapisid = pairs.get("SAPISID", "")
+            _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+            return cookie_str, sapisid if sapisid else None
+        except Exception as e:
+            log(f"Cookie load error: {e}")
             return _cookie_cache["str"], _cookie_cache["sapisid"]
-        with open(cookie_file, "r") as f:
-            content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
-        else:
-            cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
-        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
-        return cookie_str, sapisid if sapisid else None
-    except Exception as e:
-        log(f"Cookie load error: {e}")
-        return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -107,7 +127,6 @@ def _build_headers() -> dict:
 def _apply_chat_persistence_flags(inner: list) -> None:
     """Apply Gemini Web persistence flags to an outgoing request payload."""
     if CONFIG.get("temporary_chats", False):
-        # Match Gemini Web temporary-chat requests.
         inner[41] = [1]
         inner[45] = 1
     else:
@@ -195,23 +214,59 @@ def extract_response_text(raw: str) -> str:
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     last_text = ""
-    for line in raw.split("\n"):
+    for line in raw.splitlines():
+        if '"wrb.fr"' not in line:
+            continue
         for t in _extract_texts_from_line(line):
             if len(t) > len(last_text):
                 last_text = t
     return clean_text(last_text)
 
 
+def _retry_policy() -> RetryPolicy:
+    return RetryPolicy(
+        attempts=max(1, int(CONFIG.get("retry_attempts", 3))),
+        base_delay_sec=max(0.0, float(CONFIG.get("retry_delay_sec", 2))),
+        backoff_multiplier=max(1.0, float(CONFIG.get("retry_backoff_multiplier", 2.0))),
+        max_delay_sec=max(0.0, float(CONFIG.get("retry_max_delay_sec", 30.0))),
+    )
+
+
+def _is_retryable_error(error: Exception) -> bool:
+    """Avoid repeating deterministic upstream rejections while retrying transient failures."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in {408, 425, 429} or 500 <= error.code <= 599
+    if isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
+        return True
+    if HAS_HTTPX and isinstance(error, httpx.TransportError):
+        return True
+    message = str(error)
+    if message.startswith("Gemini upstream rejected request:"):
+        return False
+    return message in {
+        "Gemini upstream returned an empty response",
+        "Gemini stream content changed during retry",
+    }
+
+
+def _sleep_before_retry(policy: RetryPolicy, attempt: int, error: Exception) -> None:
+    delay = policy.delay_for_retry(attempt)
+    log(f"Retry {attempt + 1}/{policy.attempts}: {error}; sleeping {delay:g}s")
+    if delay:
+        time.sleep(delay)
+
+
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
+    """Non-streaming generation with bounded, selective retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
+    policy = _retry_policy()
 
     last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
+    for attempt in range(policy.attempts):
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -229,14 +284,14 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             return text
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            if attempt >= policy.attempts - 1 or not _is_retryable_error(e):
+                break
+            _sleep_before_retry(policy, attempt, e)
     raise last_err
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Streaming generation via httpx with retry on connection failure."""
+    """Streaming generation via httpx with bounded retry and stale-client recovery."""
     if not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
@@ -246,16 +301,16 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     headers = _build_headers()
-    client = _get_httpx_client()
+    policy = _retry_policy()
 
     last_err = None
     emitted_raw_text = ""
-    for attempt in range(CONFIG["retry_attempts"]):
+    for attempt in range(policy.attempts):
+        client = _get_httpx_client()
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
                 buf = ""
-                emitted = False
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
@@ -278,7 +333,9 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             return
         except Exception as e:
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            if attempt >= policy.attempts - 1 or not _is_retryable_error(e):
+                break
+            if HAS_HTTPX and isinstance(e, httpx.TransportError):
+                _reset_httpx_client()
+            _sleep_before_retry(policy, attempt, e)
     raise last_err
