@@ -4,7 +4,12 @@ import types
 import unittest
 
 from gemini_web2api.phase4_runtime import _state, install_phase4_runtime
-from gemini_web2api.protocol import parse_tool_calls_robust, response_needs_repair, validate_tool_calls
+from gemini_web2api.protocol import (
+    parse_tool_calls_robust,
+    response_needs_repair,
+    validate_tool_calls,
+    validate_tool_choice,
+)
 from gemini_web2api.tools import _build_tool_choice_instruction, messages_to_prompt
 
 
@@ -52,6 +57,17 @@ class ToolChoiceInstructionTests(unittest.TestCase):
         text = _build_tool_choice_instruction(choice, [READ_FILE, SEARCH])
         self.assertIn('MUST call the tool "read_file"', text)
 
+    def test_invalid_named_choice_is_rejected(self):
+        choice = {"type": "function", "function": {"name": "missing"}}
+        self.assertTrue(validate_tool_choice(choice, [READ_FILE]))
+
+    def test_required_without_tools_is_rejected(self):
+        self.assertTrue(validate_tool_choice("required", []))
+
+    def test_auto_none_and_required_are_valid_modes(self):
+        for choice in ("auto", "none", "required"):
+            self.assertFalse(validate_tool_choice(choice, [READ_FILE]))
+
 
 class ParsingAndValidationTests(unittest.TestCase):
     def test_malformed_json_is_not_accepted(self):
@@ -59,6 +75,7 @@ class ParsingAndValidationTests(unittest.TestCase):
         clean, calls = parse_tool_calls_robust(text)
         self.assertEqual(calls, [])
         self.assertIn("@@TOOL_CALL@@", clean)
+        self.assertTrue(response_needs_repair(text, calls, [READ_FILE], "auto"))
 
     def test_wrong_tool_name_is_rejected(self):
         text = '@@TOOL_CALL@@\n{"name":"delete_file","arguments":{"path":"x"}}\n@@END_TOOL_CALL@@'
@@ -116,6 +133,11 @@ class ParsingAndValidationTests(unittest.TestCase):
 
     def test_required_detects_missing_call(self):
         self.assertTrue(response_needs_repair("plain answer", [], [READ_FILE], "required"))
+
+    def test_none_rejects_tool_call(self):
+        text = '@@TOOL_CALL@@\n{"name":"read_file","arguments":{"path":"x"}}\n@@END_TOOL_CALL@@'
+        _, calls = parse_tool_calls_robust(text)
+        self.assertTrue(response_needs_repair(text, calls, [READ_FILE], "none"))
 
     def test_named_required_detects_wrong_tool(self):
         choice = {"type": "function", "function": {"name": "read_file"}}
@@ -179,19 +201,21 @@ class RuntimeToolChoiceTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("read_file", calls[1])
 
-    def test_none_does_not_emit_tool_calls(self):
+    def test_none_repairs_upstream_tool_call_to_text(self):
+        calls = []
         tool_call = '@@TOOL_CALL@@\n{"name":"read_file","arguments":{"path":"x"}}\n@@END_TOOL_CALL@@'
 
-        def generate(*_a, **_k):
-            return tool_call
+        def generate(prompt, *_a, **_k):
+            calls.append(prompt)
+            return tool_call if len(calls) == 1 else "hello"
 
         module = self._install_with(generate)
         _state.tool_defs = [READ_FILE]
         _state.tool_choice = "none"
-        # Phase 6 policy: a none request must not deliver a tool call downstream.
         result = module.generate("Say hello")
-        self.assertNotIn("@@TOOL_CALL@@", result)
-        self.assertIn("read_file", result)
+        self.assertEqual(result, "hello")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Do not emit any tool call", calls[1])
 
     def test_malformed_tool_call_gets_one_repair(self):
         calls = []
@@ -207,6 +231,28 @@ class RuntimeToolChoiceTests(unittest.TestCase):
         _state.tool_choice = "auto"
         result = module.generate("Read x")
         self.assertEqual(result, valid)
+        self.assertEqual(len(calls), 2)
+
+    def test_invalid_tool_choice_does_not_invent_intent(self):
+        module = self._install_with(lambda *_a, **_k: "should not matter")
+        _state.tool_defs = [READ_FILE]
+        _state.tool_choice = {"type": "function", "function": {"name": "missing"}}
+        with self.assertRaisesRegex(RuntimeError, "tool_call_recovery_failed: invalid_tool_schema"):
+            module.generate("Do the user's task")
+
+    def test_repair_is_bounded(self):
+        calls = []
+        invalid = '@@TOOL_CALL@@\n{"name":"search","arguments":{}}\n@@END_TOOL_CALL@@'
+
+        def generate(prompt, *_a, **_k):
+            calls.append(prompt)
+            return invalid
+
+        module = self._install_with(generate)
+        _state.tool_defs = [SEARCH]
+        _state.tool_choice = "required"
+        with self.assertRaisesRegex(RuntimeError, "tool_call_recovery_failed"):
+            module.generate("Search for alpha")
         self.assertEqual(len(calls), 2)
 
 
