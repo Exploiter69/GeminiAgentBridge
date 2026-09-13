@@ -1,0 +1,53 @@
+name: Phase 4 direct verification
+
+on:
+  push:
+    branches: [phase4-complete-direct]
+  pull_request:
+    branches: [agent-protocol-v1]
+
+permissions:
+  contents: write
+
+jobs:
+  phase4:
+    if: github.event_name == 'pull_request' || github.event.head_commit.message != 'Phase 4 direct apply'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+
+      - name: Apply Phase 4 runtime patch
+        run: python scripts/apply_phase4.py
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Compile check
+        run: python -m compileall -q gemini_web2api scripts
+
+      - name: Diff check
+        run: git diff --check
+
+      - name: Commit verified Phase 4 changes
+        if: github.event_name == 'push'
+        run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add gemini_web2api.py gemini_web2api tests scripts
+          git commit -m 'Phase 4 direct apply'
+          git push origin phase4-complete-direct
