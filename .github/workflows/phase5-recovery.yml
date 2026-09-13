@@ -1,0 +1,47 @@
+name: Phase 5 recovery verification
+
+on:
+  push:
+    branches: [phase4-complete-direct]
+  pull_request:
+    branches: [agent-protocol-v1]
+
+permissions:
+  contents: read
+
+jobs:
+  phase5:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+
+      - name: Focused Phase 5 tests
+        run: python -m unittest tests.test_phase5_recovery -v
+
+      - name: Full test suite
+        run: python -m pytest -q
+
+      - name: Compile check
+        run: python -m compileall -q gemini_web2api scripts
+
+      - name: Diff check
+        run: git diff --check
+
+      - name: Credential-safety source check
+        run: |
+          ! grep -RInE 'Authorization: Bearer [A-Za-z0-9._-]{12,}|(api[_-]?key|token|cookie|sapisid)[[:space:]]*=[[:space:]]*[A-Za-z0-9._-]{12,}' \
+            gemini_web2api tests scripts --exclude='*.pyc'
