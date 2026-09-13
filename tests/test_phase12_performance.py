@@ -121,10 +121,10 @@ class Phase12PerformanceTests(unittest.TestCase):
     def test_parser_fast_path_preserves_longest_response(self):
         payloads = []
         for text in ("short", "the final response", "the final response with more detail"):
-            inner = [None, None, None, None, [[None, [text]]]]
+            inner = [None, None, None, None, [[None, [text + " " + ("x" * 220)]]]]
             payloads.append(json.dumps([["wrb.fr", None, json.dumps(inner)]], separators=(",", ":")))
         raw = "noise line\n" + "\n".join(payloads)
-        self.assertEqual(extract_response_text(raw), "the final response with more detail")
+        self.assertEqual(extract_response_text(raw), "the final response with more detail " + ("x" * 220))
 
     def test_enum_coercion_does_not_mutate_unknown_values(self):
         calls = [{
