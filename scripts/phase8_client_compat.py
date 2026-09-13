@@ -177,8 +177,9 @@ def _hermes_env(root: Path, port: int) -> dict[str, str]:
     return env
 
 
-def _opencode_config(workspace: Path, port: int) -> None:
-    # OpenCode 1.18.x uses the V1 provider schema.
+def _opencode_config(workspace: Path, port: int) -> Path:
+    # OpenCode 1.18.x uses the V1 provider schema. Explicit model limits are
+    # required by some 1.18.x provider-resolution paths.
     config = {
         "$schema": "https://opencode.ai/config.json",
         "model": f"phase8/{MODEL}",
@@ -187,30 +188,46 @@ def _opencode_config(workspace: Path, port: int) -> None:
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Phase 8 Bridge Test",
                 "options": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": "phase8-test"},
-                "models": {MODEL: {"name": MODEL}},
+                "models": {
+                    MODEL: {
+                        "name": MODEL,
+                        "limit": {"context": 128000, "output": 8192},
+                    }
+                },
             }
         },
     }
-    (workspace / "opencode.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    path = workspace / "opencode-phase8.json"
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return path
 
 
 def _run(name: str, prompt: str, workspace: Path, root: Path, port: int) -> dict:
     if name == "hermes":
         env = _hermes_env(root, port)
-        # -z is Hermes' scripted one-shot entry point and is supported by the
-        # installed CLI even when `chat --oneshot` is unavailable.
-        cmd = ["hermes", "-z", "-m", MODEL, "-t", "file,terminal", prompt]
+        # Hermes' -z consumes the prompt immediately; options must follow the
+        # prompt only when supported by the parser. Put all options first and
+        # the prompt last so argparse cannot consume -m as the prompt.
+        cmd = ["hermes", "-z", prompt, "-m", MODEL, "-t", "file,terminal"]
     else:
         env = os.environ.copy()
         env.pop("OPENAI_API_KEY", None)
         env.pop("OPENAI_BASE_URL", None)
-        _opencode_config(workspace, port)
-        cmd = ["opencode", "run", "--auto", "--model", f"phase8/{MODEL}", prompt]
+        env_home = root / "opencode-home"
+        env_home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(env_home)
+        env["XDG_CONFIG_HOME"] = str(env_home / ".config")
+        config_path = _opencode_config(workspace, port)
+        env["OPENCODE_CONFIG"] = str(config_path)
+        cmd = [
+            "opencode", "run", "--print-logs", "--log-level", "DEBUG",
+            "--auto", "--model", f"phase8/{MODEL}", prompt,
+        ]
     proc = subprocess.run(cmd, cwd=workspace, env=env, text=True, capture_output=True, timeout=120)
     output = (proc.stdout + "\n" + proc.stderr).strip()
     marker = _marker(prompt)
     return {"returncode": proc.returncode, "passed": proc.returncode == 0 and marker in output,
-            "marker": marker, "output_tail": output[-1500:]}
+            "marker": marker, "output_tail": output[-2500:]}
 
 
 def _workspace(root: Path, case) -> Path:
