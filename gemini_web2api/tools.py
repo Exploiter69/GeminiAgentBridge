@@ -200,8 +200,9 @@ def parse_tool_calls(text: str) -> tuple:
 
 
 def build_tool_prompt(tool_defs: list) -> str:
-    """Build natural tool-use prompt for Gemini Web that avoids prompt-injection detection."""
-    tool_spec = json.dumps(tool_defs, indent=2, ensure_ascii=False)
+    """Build compact, callable tool-use prompt for Gemini Web."""
+    compact_defs = normalize_tool_definitions(tool_defs)
+    tool_spec = json.dumps(compact_defs, ensure_ascii=False, separators=(",", ":"))
     return (
         "# Tool Use\n\n"
         "You can call the following tools to help accomplish tasks. "
