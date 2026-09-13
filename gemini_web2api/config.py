@@ -17,6 +17,8 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    # 0 disables compaction until a measured deployment budget is selected.
+    "prompt_soft_budget_chars": 0,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
