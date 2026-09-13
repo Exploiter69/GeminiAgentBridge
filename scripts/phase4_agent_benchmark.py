@@ -52,7 +52,7 @@ def load_local_api_key() -> str:
     return ""
 
 
-API_KEY = os.getenv("BRIDGE_API_KEY") or os.getenv("GEMINI_WEB_API_KEY") or load_local_api_key()
+API_KEY = os.getenv("BRIDGE_API_KEY") or load_local_api_key()
 
 
 def tools(n: int) -> list[dict]:
