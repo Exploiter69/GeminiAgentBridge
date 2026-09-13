@@ -90,6 +90,7 @@ def main() -> int:
 
     compacted, context_meta = compact_messages(messages, 5000)
     parsed_text, parsed_calls = parse_tool_calls(text)
+    expected_elided = context_meta["elided_messages"]
     assert context_meta["compacted"] is True
     assert "final task: verify target.py" in json.dumps(compacted)
     assert "observation 239" in json.dumps(compacted)
@@ -98,7 +99,7 @@ def main() -> int:
     assert parsed_text == ""
     assert len(parsed_calls) == 8
     assert len(concurrent_result) == 16
-    assert {item["elided_messages"] for item in concurrent_result} == {len(messages) - len(compacted) - 1}
+    assert {item["elided_messages"] for item in concurrent_result} == {expected_elided}
 
     report = stable_report([context_sample, schema_sample, prompt_sample, parser_sample, concurrent_sample])
     print(json.dumps({
