@@ -6,20 +6,9 @@ from gemini_web2api.planner import PlannerProposal, propose, proposal_to_tool_ca
 
 
 def tool(name, description, properties=None, required=None):
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties or {},
-                "required": required or [],
-                "additionalProperties": False,
-            },
-        },
-    }
-
+    return {"type": "function", "function": {"name": name, "description": description,
+            "parameters": {"type": "object", "properties": properties or {},
+                           "required": required or [], "additionalProperties": False}}}
 
 READ = tool("read_file", "Read a file from the workspace.", {"path": {"type": "string"}}, ["path"])
 SEARCH = tool("search", "Search the codebase for a query.", {"query": {"type": "string"}}, ["query"])
@@ -33,8 +22,7 @@ class PlannerPolicyTests(unittest.TestCase):
 
     def test_obvious_read_is_high_confidence(self):
         p = propose('Read "sample.txt"', [READ])
-        self.assertEqual(p.confidence, "high")
-        self.assertEqual(p.tool_name, "read_file")
+        self.assertEqual((p.confidence, p.tool_name), ("high", "read_file"))
         self.assertEqual(p.arguments, {"path": "sample.txt"})
         self.assertTrue(p.should_synthesize)
 
@@ -52,6 +40,13 @@ class PlannerPolicyTests(unittest.TestCase):
         p = propose('Edit "app.py"', [EDIT])
         self.assertEqual(p.confidence, "high")
         self.assertEqual(p.arguments, {"path": "app.py"})
+
+    def test_edit_with_missing_content_stays_medium(self):
+        edit = tool("edit_file", "Edit or modify a file.",
+                    {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"])
+        p = propose('Edit "app.py"', [edit])
+        self.assertEqual(p.confidence, "medium")
+        self.assertFalse(p.should_synthesize)
 
     def test_ambiguous_request_is_not_synthesized(self):
         p = propose("Help me with the project", [READ, SEARCH, EDIT])
@@ -85,24 +80,17 @@ class PlannerPolicyTests(unittest.TestCase):
     def test_serialization_uses_strict_protocol(self):
         p = propose('Read "sample.txt"', [READ])
         raw = proposal_to_tool_call(p)
-        self.assertIsNotNone(raw)
         body = raw.split("@@TOOL_CALL@@\n", 1)[1].split("\n@@END_TOOL_CALL@@", 1)[0]
         self.assertEqual(json.loads(body), {"name": "read_file", "arguments": {"path": "sample.txt"}})
 
     def test_planner_never_executes_tools(self):
-        called = []
         p = propose('Read "sample.txt"', [READ])
-        called.append(p)
-        self.assertEqual(len(called), 1)
         self.assertEqual(p.tool_name, "read_file")
 
 
 class PlannerProposalTests(unittest.TestCase):
     def test_low_and_medium_are_explicitly_non_synthesizing(self):
-        for p in (
-            PlannerProposal("low", "uncertain"),
-            PlannerProposal("medium", "needs clarification"),
-        ):
+        for p in (PlannerProposal("low", "uncertain"), PlannerProposal("medium", "needs clarification")):
             self.assertFalse(p.should_synthesize)
             self.assertIsNone(proposal_to_tool_call(p))
 
