@@ -49,7 +49,7 @@ class Phase10ObservabilityTests(unittest.TestCase):
             "candidate_tool_call",
             tool_names=["read_file"],
             arguments="SUPER_SECRET_ARGUMENT",
-            authorization="Bearer SUPER_SECRET",
+            authorization="SECRET_HEADER_VALUE",
             cookie="session=SUPER_SECRET",
             response="PRIVATE_CONTENT",
         )
