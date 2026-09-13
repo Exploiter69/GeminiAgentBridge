@@ -4,7 +4,7 @@ on:
   push:
     branches: [phase8-compatibility]
   pull_request:
-    branches: [phase8-compatibility]
+    branches: [phase7-planner]
 
 jobs:
   compatibility:
