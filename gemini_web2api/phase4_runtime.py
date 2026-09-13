@@ -167,7 +167,7 @@ def install_phase4_runtime(handler_cls) -> None:
             error_lines = errors if errors else ["tool call was required but was not produced"]
             repair_prompt = build_repair_prompt(prompt, error_lines)
             module.log(f"Phase5 tool repair attempt {attempt + 1}/{attempts} type={(failure.error_type.value if failure else 'unknown')}")
-            repaired_raw = generate_once(repair_prompt)
+            repaired_raw = recover_raw(generate_once(repair_prompt))
             _, repaired_calls = parse_tool_calls_robust(repaired_raw)
             repaired_errors = validate_tool_calls(repaired_calls, tool_defs)
             if not response_needs_repair(repaired_raw, repaired_calls, tool_defs, tool_choice):
