@@ -1,4 +1,4 @@
-"""Runtime integration for Phase 4 and Phase 5 reliability features."""
+"""Runtime integration for Phase 4, Phase 5, and Phase 6 reliability features."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,14 @@ from .config import CONFIG
 from .grounding import GroundingFacts
 from .observability import TRACE_HEADER, elapsed_ms, new_trace_id, request_summary, response_summary
 from . import tools as phase4_tools
-from .protocol import build_repair_prompt, parse_tool_calls_robust, response_needs_repair, validate_tool_calls
+from .protocol import (
+    build_repair_prompt,
+    parse_tool_calls_robust,
+    response_needs_repair,
+    tool_choice_name,
+    validate_tool_calls,
+    validate_tool_choice,
+)
 from .recovery import classify_exception, classify_tool_validation, classify_upstream_text
 
 _state = threading.local()
@@ -47,7 +54,7 @@ def _module_for(cls) -> ModuleType:
 
 
 def install_phase4_runtime(handler_cls) -> None:
-    """Install the Phase 4/5 contract on legacy and modular handlers."""
+    """Install the Phase 4/5/6 contract on legacy and modular handlers."""
     if getattr(handler_cls, "_phase4_installed", False):
         return
 
@@ -151,36 +158,60 @@ def install_phase4_runtime(handler_cls) -> None:
         module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
         raise RuntimeError(f"upstream {failure.error_type.value}: {failure.message}") from None
 
+    def _choice_errors(tool_calls, tool_defs, tool_choice):
+        errors = []
+        errors.extend(validate_tool_choice(tool_choice, tool_defs))
+        requested = tool_choice_name(tool_choice)
+        if tool_choice == "none" and tool_calls:
+            errors.append("tool_choice=none forbids all tool calls")
+        elif requested:
+            if not tool_calls:
+                errors.append(f"tool_choice requires requested tool '{requested}'")
+            else:
+                for index, call in enumerate(tool_calls):
+                    actual = call.get("function", {}).get("name")
+                    if actual != requested:
+                        errors.append(f"tool_calls[{index}]: tool '{actual}' violates requested tool '{requested}'")
+        return errors
+
     def repair_tool_response(prompt: str, raw: str, generate_once):
         tool_defs, tool_choice = _current_tool_context()
-        if not tool_defs:
+        if not tool_defs and tool_choice != "none":
             return raw
 
         _, calls = parse_tool_calls_robust(raw)
         errors = validate_tool_calls(calls, tool_defs)
+        errors.extend(_choice_errors(calls, tool_defs, tool_choice))
         if not response_needs_repair(raw, calls, tool_defs, tool_choice):
             return raw
 
         attempts = max(0, int(CONFIG.get("tool_repair_attempts", 1) or 0))
         for attempt in range(attempts):
-            failure = classify_tool_validation(errors)
+            failure = classify_tool_validation(errors) if errors else None
             error_lines = errors if errors else ["tool call was required but was not produced"]
-            repair_prompt = build_repair_prompt(prompt, error_lines)
-            module.log(f"Phase5 tool repair attempt {attempt + 1}/{attempts} type={(failure.error_type.value if failure else 'unknown')}")
+            repair_prompt = build_repair_prompt(prompt, error_lines, tool_choice, tool_defs)
+            module.log(f"Phase6 tool-choice repair attempt {attempt + 1}/{attempts} type={(failure.error_type.value if failure else 'tool_choice')}")
             repaired_raw = generate_once(repair_prompt)
             repaired_raw = recover_raw(repaired_raw)
             _, repaired_calls = parse_tool_calls_robust(repaired_raw)
             repaired_errors = validate_tool_calls(repaired_calls, tool_defs)
+            repaired_errors.extend(_choice_errors(repaired_calls, tool_defs, tool_choice))
             if not response_needs_repair(repaired_raw, repaired_calls, tool_defs, tool_choice):
                 return repaired_raw
             errors = repaired_errors or ["tool call remained invalid after repair"]
 
         failure = classify_tool_validation(errors)
-        error_type = failure.error_type.value if failure else "invalid_tool_schema"
+        error_type = failure.error_type.value if failure else "invalid_tool_choice"
         raise RuntimeError(f"tool_call_recovery_failed: {error_type}") from None
 
     def parse_calls(text: str):
-        return parse_tool_calls_robust(text)
+        tool_defs, tool_choice = _current_tool_context()
+        clean, calls = parse_tool_calls_robust(text)
+        errors = validate_tool_calls(calls, tool_defs)
+        errors.extend(_choice_errors(calls, tool_defs, tool_choice))
+        if errors:
+            return clean, calls
+        return clean, calls
 
     handler_cls.send_json = send_json
     if hasattr(handler_cls, "_start_sse"):
@@ -249,4 +280,4 @@ def install_phase4_runtime(handler_cls) -> None:
         module._phase5_legacy_generate_wrapped = True
 
     handler_cls._phase4_installed = True
-    module.log(str(request_summary("RUNTIME", "phase4", "phase4+phase5 installed", 0)))
+    module.log(str(request_summary("RUNTIME", "phase4", "phase4+phase5+phase6 installed", 0)))
