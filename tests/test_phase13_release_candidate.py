@@ -23,7 +23,7 @@ class Phase13ReleaseCandidateTests(unittest.TestCase):
         self.assertIn('"merge-base"', text)
         self.assertIn('"--is-ancestor"', text)
         self.assertIn("working_tree_clean", text)
-        self.assertIn("real_client_execution", text)
+        self.assertIn("real_client_evidence_recorded", text)
 
 
 if __name__ == "__main__":
