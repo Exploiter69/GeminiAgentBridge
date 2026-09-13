@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Phase 8 real-client compatibility smoke harness.
+"""Phase 8 real-client compatibility harness.
 
-Drives installed Hermes and/or OpenCode against the real bridge HTTP handler,
-but replaces only the upstream Gemini generation function with a deterministic
-model stub. This isolates client/bridge compatibility without credentials or
-paid inference. Every matrix case uses a fresh disposable workspace.
+Runs installed Hermes/OpenCode against a real local bridge HTTP handler while
+stubbing only upstream Gemini generation. No credentials or paid inference are
+used; each matrix case gets a fresh disposable workspace.
 """
 from __future__ import annotations
 
@@ -31,7 +30,7 @@ from gemini_web2api.server import GeminiHandler, ThreadedServer
 MODEL = "gemini-3.6-flash"
 
 
-def _extract_tools(prompt: str) -> list[dict]:
+def _tools(prompt: str) -> list[dict]:
     marker = "Available tools:\n"
     pos = prompt.find(marker)
     if pos < 0:
@@ -43,136 +42,118 @@ def _extract_tools(prompt: str) -> list[dict]:
         return []
 
 
-def _tool_schema(tool: dict) -> tuple[str, dict]:
-    name = str(tool.get("name", ""))
-    schema = tool.get("parameters") or {}
-    return name, schema if isinstance(schema, dict) else {}
+def _schema(tool: dict) -> tuple[str, dict]:
+    return str(tool.get("name", "")), tool.get("parameters") or {}
 
 
-def _pick_tool(tools: list[dict], kind: str) -> tuple[str, dict] | None:
+def _pick(tools: list[dict], kind: str) -> tuple[str, dict] | None:
     aliases = {
+        "list": ("list_files", "list", "glob", "ls"),
         "read": ("read_file", "read", "cat"),
         "write": ("write_file", "write", "create_file"),
-        "edit": ("edit_file", "patch", "edit"),
+        "edit": ("edit_file", "edit", "patch"),
         "search": ("search_files", "search", "grep", "glob"),
         "terminal": ("terminal", "bash", "shell", "run_command", "command"),
-        "list": ("list_files", "glob", "list", "ls"),
     }
     for tool in tools:
-        name, schema = _tool_schema(tool)
+        name, schema = _schema(tool)
         low = name.lower()
         if low in aliases[kind] or any(alias in low for alias in aliases[kind]):
             return name, schema
     return None
 
 
-def _arg_value(key: str, prompt: str) -> object:
-    low = key.lower()
-    if low in {"path", "file", "file_path", "filepath", "filename"}:
-        if "summary" in prompt.lower():
-            return "summary.txt"
-        if "created" in prompt.lower():
-            return "created.txt"
-        return "sample.txt"
-    if low in {"content", "text", "new_content", "file_content"}:
-        return "PHASE8_SUMMARY_OK\n" if "summary" in prompt.lower() else "PHASE8_CREATE_OK\n"
-    if low in {"old_string", "old", "find", "search_string"}:
+def _value(key: str, prompt: str) -> object:
+    key = key.lower()
+    p = prompt.lower()
+    if key in {"path", "file", "file_path", "filepath", "filename"}:
+        return "summary.txt" if "summary" in p else "sample.txt"
+    if key in {"content", "text", "new_content", "file_content"}:
+        return "PHASE8_SUMMARY_OK\n" if "summary" in p else "PHASE8_CREATE_OK\n"
+    if key in {"old_string", "old", "find", "search_string"}:
         return "alpha"
-    if low in {"new_string", "replacement", "replace"}:
+    if key in {"new_string", "replacement", "replace"}:
         return "PHASE8_EDIT_OK"
-    if low in {"pattern", "query", "search_query"}:
+    if key in {"pattern", "query", "search_query"}:
         return "sample.txt"
-    if low == "target":
+    if key == "target":
         return "files"
-    if low in {"command", "cmd", "shell"}:
-        text = prompt.lower()
-        if "git status" in text:
+    if key in {"command", "cmd", "shell"}:
+        if "git status" in p:
             return "git status --short"
-        if "git diff" in text:
+        if "git diff" in p:
             return "git diff --no-ext-diff"
-        if "test command" in text:
+        if "test command" in p:
             return "python -c \"print('PHASE8_TEST_OK')\""
         return "printf PHASE8_TERMINAL_OK"
-    if low in {"workdir", "cwd", "directory"}:
+    if key in {"workdir", "cwd", "directory"}:
         return "."
-    if low == "offset":
-        return 1
-    if low == "limit":
-        return 100
     return None
 
 
-def _arguments_for(schema: dict, prompt: str) -> dict:
+def _args(schema: dict, prompt: str) -> dict:
     props = schema.get("properties") or {}
-    args: dict = {}
+    out = {}
     for key in schema.get("required", []) or []:
-        value = _arg_value(str(key), prompt)
+        value = _value(str(key), prompt)
         if value is not None:
-            args[key] = value
+            out[key] = value
     for key in props:
-        if key in args:
+        if key in out:
             continue
-        value = _arg_value(str(key), prompt)
-        if value is not None and str(key).lower() in {
-            "path", "content", "pattern", "query", "command", "workdir",
-            "old_string", "new_string", "target",
-        }:
-            args[key] = value
-    return args
+        value = _value(str(key), prompt)
+        if value is not None:
+            out[key] = value
+    return out
 
 
-def _emit_tool(tool: tuple[str, dict], prompt: str) -> str:
-    name, schema = tool
-    return "```tool_call\n" + json.dumps({"name": name, "arguments": _arguments_for(schema, prompt)}) + "\n```"
-
-
-def _case_marker(prompt: str) -> str:
+def _marker(prompt: str) -> str:
     match = re.search(r"reply exactly (PHASE8_[A-Z0-9_]+)", prompt)
     return match.group(1) if match else "PHASE8_OK"
 
 
-def _stub_generate(prompt: str, *args, **kwargs) -> str:
-    tools = _extract_tools(prompt)
-    lower = prompt.lower()
-    observations = prompt.count("[Tool result for")
-    marker = _case_marker(prompt)
+def _stub(prompt: str, *args, **kwargs) -> str:
+    tools = _tools(prompt)
     if not tools:
-        return marker
-    if "long task" in lower:
-        sequence, required = ["list", "read", "terminal", "write"], 4
-        kind = sequence[min(observations, required - 1)]
-    elif "multi-step" in lower and "create summary" in lower:
-        sequence, required = ["list", "read", "write"], 3
-        kind = sequence[min(observations, required - 1)]
-    elif "search then read" in lower:
-        required, kind = 2, ("search" if observations == 0 else "read")
-    elif "search then edit" in lower:
-        required, kind = 2, ("search" if observations == 0 else "edit")
-    elif "create" in lower:
-        required, kind = 1, "write"
-    elif "edit" in lower:
-        required, kind = 1, "edit"
-    elif "terminal" in lower or "test command" in lower or "git status" in lower or "git diff" in lower:
-        required, kind = 1, "terminal"
-    elif "search" in lower:
-        required, kind = 1, "search"
-    elif "list" in lower:
-        required, kind = 1, "list"
+        return _marker(prompt)
+    p = prompt.lower()
+    n = prompt.count("[Tool result for")
+    if "long task" in p:
+        sequence = ("list", "read", "terminal", "write")
+    elif "multi-step" in p:
+        sequence = ("list", "read", "write")
+    elif "search then read" in p:
+        sequence = ("search", "read")
+    elif "search then edit" in p:
+        sequence = ("search", "edit")
+    elif "create" in p:
+        sequence = ("write",)
+    elif "edit" in p:
+        sequence = ("edit",)
+    elif any(x in p for x in ("terminal", "test command", "git status", "git diff")):
+        sequence = ("terminal",)
+    elif "search" in p:
+        sequence = ("search",)
+    elif "list" in p:
+        sequence = ("list",)
     else:
-        required, kind = 1, "read"
-    if observations >= required:
-        return marker
-    selected = _pick_tool(tools, kind)
-    return "PHASE8_NO_MATCHING_TOOL" if selected is None else _emit_tool(selected, prompt)
+        sequence = ("read",)
+    if n >= len(sequence):
+        return _marker(prompt)
+    selected = _pick(tools, sequence[n])
+    if selected is None:
+        return _marker(prompt)
+    name, schema = selected
+    return "```tool_call\n" + json.dumps({"name": name, "arguments": _args(schema, prompt)}) + "\n```"
 
 
-def _start_bridge() -> tuple[ThreadedServer, threading.Thread, list]:
+def _bridge():
     CONFIG["api_keys"] = []
     CONFIG["log_requests"] = False
     server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
     patches = [
-        mock.patch("gemini_web2api.server.generate", side_effect=_stub_generate),
-        mock.patch("gemini_web2api.server.generate_stream", side_effect=lambda prompt, *a, **kw: iter([_stub_generate(prompt, *a, **kw)])),
+        mock.patch("gemini_web2api.server.generate", side_effect=_stub),
+        mock.patch("gemini_web2api.server.generate_stream", side_effect=lambda prompt, *a, **kw: iter([_stub(prompt, *a, **kw)])),
     ]
     for patcher in patches:
         patcher.start()
@@ -185,8 +166,8 @@ def _hermes_env(root: Path, port: int) -> dict[str, str]:
     home = root / "hermes-home"
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
-        "model:\n" f"  default: {MODEL}\n" "  provider: custom\n" f"  base_url: http://127.0.0.1:{port}/v1\n"
-        "  api_key: phase8-test\nterminal:\n  backend: local\n  home_mode: profile\nagent:\n  max_turns: 8\n",
+        f"model:\n  default: {MODEL}\n  provider: custom\n  base_url: http://127.0.0.1:{port}/v1\n  api_key: phase8-test\n"
+        "terminal:\n  backend: local\n  home_mode: profile\nagent:\n  max_turns: 8\n",
         encoding="utf-8",
     )
     env = os.environ.copy()
@@ -196,58 +177,66 @@ def _hermes_env(root: Path, port: int) -> dict[str, str]:
     return env
 
 
-def _opencode_config(root: Path, port: int) -> None:
-    (root / "opencode.json").write_text(json.dumps({
+def _opencode_config(workspace: Path, port: int) -> None:
+    # OpenCode 1.18.x uses the V1 provider schema.
+    config = {
         "$schema": "https://opencode.ai/config.json",
         "model": f"phase8/{MODEL}",
-        "permission": "allow",
-        "providers": {"phase8": {"name": "Phase 8 Bridge Test", "package": "@opencode/ai/providers/openai-compatible",
-            "settings": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": "phase8-test"},
-            "models": {MODEL: {"name": MODEL}}}},
-    }, indent=2), encoding="utf-8")
+        "provider": {
+            "phase8": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Phase 8 Bridge Test",
+                "options": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": "phase8-test"},
+                "models": {MODEL: {"name": MODEL}},
+            }
+        },
+    }
+    (workspace / "opencode.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
-def _run_client(name: str, case_prompt: str, workspace: Path, port: int, root: Path) -> dict:
+def _run(name: str, prompt: str, workspace: Path, root: Path, port: int) -> dict:
     if name == "hermes":
         env = _hermes_env(root, port)
-        cmd = ["hermes", "chat", "--oneshot", "-q", case_prompt, "--toolsets", "file,terminal"]
+        # -z is Hermes' scripted one-shot entry point and is supported by the
+        # installed CLI even when `chat --oneshot` is unavailable.
+        cmd = ["hermes", "-z", "-m", MODEL, "-t", "file,terminal", prompt]
     else:
         env = os.environ.copy()
         env.pop("OPENAI_API_KEY", None)
         env.pop("OPENAI_BASE_URL", None)
         _opencode_config(workspace, port)
-        cmd = ["opencode", "run", "--auto", "--model", f"phase8/{MODEL}", case_prompt]
+        cmd = ["opencode", "run", "--auto", "--model", f"phase8/{MODEL}", prompt]
     proc = subprocess.run(cmd, cwd=workspace, env=env, text=True, capture_output=True, timeout=120)
-    combined = (proc.stdout + "\n" + proc.stderr).strip()
-    marker = _case_marker(case_prompt)
-    return {"returncode": proc.returncode, "passed": proc.returncode == 0 and marker in combined,
-            "marker": marker, "output_tail": combined[-1500:]}
+    output = (proc.stdout + "\n" + proc.stderr).strip()
+    marker = _marker(prompt)
+    return {"returncode": proc.returncode, "passed": proc.returncode == 0 and marker in output,
+            "marker": marker, "output_tail": output[-1500:]}
 
 
-def _workspace_for_case(root: Path, case) -> Path:
-    workspace = root / case.name
-    workspace.mkdir(parents=True)
-    (workspace / "sample.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
-    (workspace / "README.md").write_text("phase8 fixture\n", encoding="utf-8")
-    if case.name.startswith("git_"):
-        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
-        subprocess.run(["git", "add", "sample.txt", "README.md"], cwd=workspace, check=True)
-        subprocess.run(["git", "-c", "user.name=Phase8", "-c", "user.email=phase8@example.invalid", "commit", "-qm", "fixture"], cwd=workspace, check=True)
-    return workspace
+def _workspace(root: Path, case) -> Path:
+    path = root / case.name
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "sample.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    (path / "README.md").write_text("phase8 fixture\n", encoding="utf-8")
+    if case.name in {"git_status", "git_diff"}:
+        subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+        subprocess.run(["git", "add", "sample.txt", "README.md"], cwd=path, check=True)
+        subprocess.run(["git", "-c", "user.name=Phase8", "-c", "user.email=phase8@example.invalid", "commit", "-qm", "fixture"], cwd=path, check=True)
+    return path
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hermes", action="store_true", help="Require and run Hermes")
-    parser.add_argument("--opencode", action="store_true", help="Require and run OpenCode")
+    parser.add_argument("--hermes", action="store_true")
+    parser.add_argument("--opencode", action="store_true")
     args = parser.parse_args()
-    clients = [n for n, required in (("hermes", args.hermes), ("opencode", args.opencode)) if required]
+    clients = [name for name, enabled in (("hermes", args.hermes), ("opencode", args.opencode)) if enabled]
     if not clients:
         print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "real_clients": "not requested", "self_check": True}, indent=2))
         return 0
     with tempfile.TemporaryDirectory(prefix="gemini-agent-bridge-phase8-") as td:
         root = Path(td)
-        server, thread, patches = _start_bridge()
+        server, thread, patches = _bridge()
         port = server.server_address[1]
         results = {}
         try:
@@ -255,19 +244,24 @@ def main() -> int:
                 if not shutil.which(client):
                     results[client] = {"passed": False, "error": "client not installed"}
                     continue
-                client_cases = {}
+                cases = {}
+                client_root = root / client
+                client_root.mkdir()
                 for case in COMPATIBILITY_MATRIX:
-                    workspace = _workspace_for_case(root / client, case)
-                    marker = f"PHASE8_{case.name.upper()}_OK"
-                    prompt = f"{case.prompt} After actually completing the task, reply exactly {marker}."
+                    workspace = _workspace(client_root, case)
+                    prompt = f"{case.prompt} After actually completing the task, reply exactly PHASE8_{case.name.upper()}_OK."
                     try:
-                        client_cases[case.name] = _run_client(client, prompt, workspace, port, root)
+                        cases[case.name] = _run(client, prompt, workspace, root, port)
                     except subprocess.TimeoutExpired:
-                        client_cases[case.name] = {"passed": False, "error": "client timed out"}
-                results[client] = {"cases": len(client_cases), "passed_cases": sum(1 for r in client_cases.values() if r.get("passed")),
-                                   "all_pass": all(r.get("passed") for r in client_cases.values()), "details": client_cases}
+                        cases[case.name] = {"passed": False, "error": "client timed out"}
+                results[client] = {
+                    "cases": len(cases),
+                    "passed_cases": sum(1 for result in cases.values() if result.get("passed")),
+                    "all_pass": all(result.get("passed") for result in cases.values()),
+                    "details": cases,
+                }
             print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "clients": results}, indent=2))
-            return 0 if all(r.get("all_pass") for r in results.values()) else 1
+            return 0 if all(result.get("all_pass") for result in results.values()) else 1
         finally:
             server.shutdown()
             server.server_close()
