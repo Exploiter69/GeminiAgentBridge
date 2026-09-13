@@ -5,9 +5,6 @@ Starts the actual GeminiAgentBridge HTTP handler with a deterministic in-process
 model stub, then optionally drives installed Hermes and OpenCode CLIs against it.
 No credentials are read or written. Each client gets an isolated temporary
 profile/config and a disposable workspace.
-
-By default the script only runs the local protocol harness. Pass --hermes and/or
---opencode to require and exercise those real clients.
 """
 from __future__ import annotations
 
@@ -16,10 +13,15 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
 from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from gemini_web2api.client_compat import COMPATIBILITY_MATRIX
 from gemini_web2api.config import CONFIG
