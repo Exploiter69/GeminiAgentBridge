@@ -1,7 +1,7 @@
 """Hardened HTTP boundary layered on the protocol handler."""
 from __future__ import annotations
 
-import hmac
+import itertools
 import json
 import time
 import urllib.parse
@@ -10,7 +10,9 @@ import uuid
 from .config import CONFIG
 from .gemini import generate_stream, log
 from .security import RequestBodyTooLarge, constant_time_equal, public_error
-from .server import GeminiHandler, ThreadedServer
+from .server import GeminiHandler, ThreadedServer, _upload_images
+from .tools import google_contents_to_prompt, messages_to_prompt
+from .models import resolve_model
 
 
 class HardenedGeminiHandler(GeminiHandler):
@@ -66,8 +68,7 @@ class HardenedGeminiHandler(GeminiHandler):
                 chunk = self.rfile.read(size)
                 if len(chunk) != size:
                     raise ValueError("truncated chunked request body")
-                terminator = self.rfile.read(2)
-                if terminator != b"\r\n":
+                if self.rfile.read(2) != b"\r\n":
                     raise ValueError("invalid chunked request body")
                 chunks.append(chunk)
                 total += size
@@ -84,7 +85,10 @@ class HardenedGeminiHandler(GeminiHandler):
             raise ValueError("invalid content length")
         if length > max_bytes:
             raise RequestBodyTooLarge()
-        return self.rfile.read(length)
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError("truncated request body")
+        return body
 
     def _safe_stream_error(self, event: str = "error"):
         payload = {"error": {"message": "upstream stream failed"}}
@@ -113,9 +117,14 @@ class HardenedGeminiHandler(GeminiHandler):
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
             }
             self.wfile.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
-            self.wfile.write(
-                f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': first}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n".encode()
-            )
+            first_chunk = {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": first}, "finish_reason": None}],
+            }
+            self.wfile.write(f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n".encode())
             self.wfile.flush()
             for delta in stream:
                 if not delta:
@@ -162,7 +171,7 @@ class HardenedGeminiHandler(GeminiHandler):
                 raise RuntimeError("empty upstream stream")
             self._start_sse()
             committed = True
-            for delta in (first, *stream):
+            for delta in itertools.chain((first,), stream):
                 if not delta:
                     continue
                 chunk_obj = {
@@ -171,7 +180,8 @@ class HardenedGeminiHandler(GeminiHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
-            self.wfile.write(f"data: {json.dumps({'candidates': [{'finishReason': 'STOP', 'index': 0}], 'modelVersion': model_name})}\n\n".encode())
+            final = {"candidates": [{"finishReason": "STOP", "index": 0}], "modelVersion": model_name}
+            self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             log("Google stream client disconnected")
@@ -190,15 +200,11 @@ class HardenedGeminiHandler(GeminiHandler):
     def _handle_chat(self, body: bytes):
         req = self._parse_body(body)
         if isinstance(req, dict) and req.get("stream") and (not req.get("tools") or req.get("tool_choice", "auto") == "none"):
-            from .models import resolve_model
-            from .server import _upload_images
             model_name, model_id, think_mode, err, extra_fields = resolve_model(req.get("model", CONFIG["default_model"]))
             if err:
                 self.send_json({"error": {"message": err}}, 400)
                 return
-            prompt, images = __import__("gemini_web2api.tools", fromlist=["messages_to_prompt"]).messages_to_prompt(
-                req.get("messages", []), req.get("tools"), req.get("tool_choice", "auto")
-            )
+            prompt, images = messages_to_prompt(req.get("messages", []), req.get("tools"), req.get("tool_choice", "auto"))
             if not prompt.strip():
                 self.send_json({"error": {"message": "empty prompt"}}, 400)
                 return
@@ -216,8 +222,6 @@ class HardenedGeminiHandler(GeminiHandler):
         if stream:
             req = self._parse_body(body)
             if isinstance(req, dict):
-                from .models import resolve_model
-                from .server import _upload_images
                 model_path = self.path.split("/v1beta/models/", 1)[-1].split(":", 1)[0]
                 model_name, model_id, think_mode, err, extra_fields = resolve_model(model_path or CONFIG["default_model"])
                 if err:
@@ -226,7 +230,6 @@ class HardenedGeminiHandler(GeminiHandler):
                 tool_config = req.get("toolConfig", {})
                 mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
                 if not req.get("tools") or mode == "NONE":
-                    from .tools import google_contents_to_prompt
                     prompt, images = google_contents_to_prompt(req)
                     if not prompt.strip():
                         self.send_json({"error": {"message": "empty content"}}, 400)
