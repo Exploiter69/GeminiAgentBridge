@@ -223,7 +223,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            text = extract_response_text(raw)
+            if not text:
+                raise RuntimeError("Gemini upstream returned an empty response")
+            return text
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -252,6 +255,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
                 buf = ""
+                emitted = False
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
