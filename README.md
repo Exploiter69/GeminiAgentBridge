@@ -4,60 +4,44 @@
   <img src="logo.png" width="200" alt="GeminiAgentBridge logo">
 </p>
 
-[中文文档](README_CN.md) · [Documentation](docs/README.md) · [Roadmap](roadmap.md)
+[中文文档](README_CN.md) · [Documentation](docs/README.md) · [Fixing roadmap](docs/FIXING_ROADMAP.md)
 
-> **Project status:** active transport-repair cycle. This repository is an independently maintained GeminiAgentBridge project; the current branch contains the modern Gemini Web transport work and is not yet a released production baseline. See `docs/release-status.md`.
+> **Project status:** release-hardening line. The modern Gemini Web transport is the package default, the HTTP boundary is hardened for local/explicitly authenticated remote use, and release promotion is gated on CI plus a fresh authenticated Gemini Web run and real OpenCode/Hermes validation.
 
-**GeminiAgentBridge** provides a local OpenAI-compatible API for using Gemini Web as an agent reasoning backend. Hermes, OpenCode, and similar clients remain responsible for filesystem, terminal, Git, and other downstream tool execution.
-
-## Identity
-
-This repository is branded and maintained as **GeminiAgentBridge**. The internal `gemini_web2api` Python module and the `gemini-web2api` compatibility command remain intentionally stable so existing local integrations do not break.
+**GeminiAgentBridge** provides a local OpenAI-compatible API for using Gemini Web as an agent reasoning backend. Hermes, OpenCode, and similar clients remain responsible for filesystem, terminal, Git, browser, and other downstream tool execution.
 
 ## Architecture
 
 ```text
-Gemini Web
-   │
-   │ current maintained web transport
-   ▼
-┌──────────────────────────────┐
-│ GeminiAgentBridge            │
-│                              │
-│ OpenAI-compatible HTTP API   │
-│ prompt/context construction  │
-│ tool-call parsing/validation │
-│ bounded repair/recovery      │
-│ grounding + observability    │
-└──────────────┬───────────────┘
-               │
-               ▼
-       Hermes / OpenCode
-               │
-       filesystem / shell / Git
+Coding Agent
+    │
+    ▼
+OpenAI-compatible GeminiAgentBridge API
+    │
+    ├── protocol / tool-call normalization
+    ├── bounded request + image handling
+    └── cancellable streaming
+    │
+    ▼
+gemini-webapi 2.1.1
+    │
+    ▼
+Authenticated Gemini Web session
 ```
 
-**Hard boundary:** the bridge does not execute downstream tools. It can parse, validate, repair, classify, and return tool calls; Hermes/OpenCode executes them and returns observations.
+**Hard boundary:** the bridge never executes downstream tools. It returns tool calls; the agent executes them and sends the observation back.
 
-## What is current
+## Release-line guarantees
 
-- OpenAI-compatible Chat Completions and model listing.
-- Responses/API compatibility layers used by the project test suite.
-- Function/tool-call parsing, schema validation, bounded repair, and recovery.
-- Explicit grounding/context handling and observation-integrity rules.
-- Structured credential-redacted request lifecycle telemetry.
-- Conservative enum coercion and bounded retry/stability logic.
-- Hermes/OpenCode compatibility harnesses and trajectory regression benchmarks.
-- Modern Gemini Web transport through `gemini-webapi==2.1.1` on the repair branch.
-- The old direct `StreamGenerate` transport remains available only as an explicit legacy compatibility backend.
-
-## Important transport status
-
-The modern transport is the default in the package entrypoint and configuration defaults. It uses a long-lived `GeminiClient`, a persistent background asyncio loop, and a local cookie/auth file when authenticated Gemini Web access is required.
-
-The current repair work was triggered because the older direct Gemini `StreamGenerate` route produced HTTP 405 responses against current Gemini Web behavior. Do not interpret an old 405 from a process started with the historical `python gemini_web2api.py` entrypoint as proof that the repaired package transport is using the same route.
-
-A live authenticated Gemini Web session is still required to prove end-to-end upstream generation. If the session is expired, the maintained client reports an authentication failure; that is distinct from a bridge protocol failure.
+- Modern `gemini-webapi==2.1.1` transport is the default.
+- Default listener is `127.0.0.1`; non-loopback binding requires configured API keys.
+- Request bodies and remote image downloads are bounded.
+- Remote image URLs are restricted to public HTTP(S) targets and redirects are revalidated.
+- Signed/upload URLs and upstream exception details are not exposed in logs or client errors.
+- Gemini Web calls are serialized initially around one long-lived `GeminiClient`; shutdown closes the client before stopping its asyncio loop.
+- Streaming preflights the first upstream delta before committing HTTP 200 and emits a structured terminal stream error after commit instead of a false `[DONE]`.
+- A stream is never retried after output has crossed the backend boundary, preventing duplicated tool-call prefixes.
+- The old `gemini-web2api` command/module name remains only as a compatibility identity; the maintained implementation is the `gemini_web2api` package.
 
 ## Quick start
 
@@ -68,12 +52,13 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.json config.json
-python -m gemini_web2api
+# edit config.json and set cookie_file to your local Gemini session file
+python -m gemini_web2api --config config.json
 ```
 
-Python **3.11+** is required by the maintained Gemini Web client.
+Python **3.11+** is required by the maintained Gemini Web client. The bridge does not accept or store credentials for you; keep the local session file at restrictive permissions such as `chmod 600`.
 
-The compatibility command is also available after installation:
+Installed entry points:
 
 ```bash
 gemini-agent-bridge
@@ -87,15 +72,31 @@ Default API base URL:
 http://127.0.0.1:8081/v1
 ```
 
-## Gemini Web session
+## Bridge authentication
 
-The modern transport can consume a local Gemini authentication file. The repository includes `gemini-cookie-sync-extension/` for exporting the browser session locally.
+Loopback use may run without a bridge API key because the service is intentionally local-only by default. **Any non-loopback listener requires at least one `api_keys` entry.** Never expose an unauthenticated instance to a LAN, VPS, container network, or public interface.
 
-```bash
-python -m gemini_web2api --cookie-file /path/to/gemini-auth.json
+Example remote configuration:
+
+```json
+{
+  "host": "0.0.0.0",
+  "api_keys": ["replace-with-a-long-random-key"],
+  "cookie_file": "/path/to/gemini-auth.json"
+}
 ```
 
-Never print, paste, commit, or share session material. Use restrictive permissions such as `chmod 600`.
+Clients can authenticate with `Authorization: Bearer <key>`, `x-api-key`, or `x-goog-api-key`.
+
+## Gemini Web session
+
+The modern backend uses a local Gemini Web authentication file. A browser/session-sync helper is included in `gemini-cookie-sync-extension/`, but session material must remain local.
+
+```bash
+python -m gemini_web2api --config config.json --cookie-file /path/to/gemini-auth.json
+```
+
+Never print, paste, commit, or share session material.
 
 ## OpenAI-compatible usage
 
@@ -108,89 +109,85 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gemini-3.1-pro",
+    model="gemini-3.6-flash",
     messages=[{"role": "user", "content": "Explain recursion simply."}],
 )
-
 print(response.choices[0].message.content)
 ```
 
-The same base URL can be used by OpenAI-compatible agent clients such as Hermes/OpenCode. See [`docs/clients.md`](docs/clients.md).
-
-## Configuration
-
-See [`docs/configuration.md`](docs/configuration.md). Important fields include `upstream_backend`, `cookie_file`, `proxy`, `api_keys`, `temporary_chats`, retry limits, and prompt/tool budgets.
+The same base URL is intended for OpenAI-compatible coding agents. See [`docs/clients.md`](docs/clients.md) and the real-client harness at `scripts/phase8_client_compat.py`.
 
 ## Tool calling
 
 ```text
 Gemini → proposes tool call
-Bridge → validates / normalizes / bounded-repairs
-Hermes/OpenCode → executes tool
-Hermes/OpenCode → returns observation
-Bridge → preserves observation integrity
-Gemini → chooses next action
+Bridge → parses / validates / normalizes the protocol
+Agent → executes the tool
+Agent → returns observation
+Bridge → preserves the observation
+Gemini → chooses the next action
 ```
 
-Bridge never executes Shell, filesystem, Git, or arbitrary downstream actions itself.
+Bridge never executes shell, filesystem, Git, or arbitrary downstream actions.
 
-## Streaming
+## Streaming semantics
 
-Chat Completions streaming uses SSE. The package uses the modern upstream transport and true downstream streaming where supported.
+Chat Completions and Gemini `streamGenerateContent` use SSE. The bridge waits for the first meaningful upstream delta before committing the HTTP success response. If the upstream fails after commitment, the bridge emits a structured stream-error event and deliberately does **not** emit `[DONE]` as a success marker.
 
-A known repair item is upstream failure after an initial SSE header/chunk has been emitted. A partial stream must never be interpreted as a successful completed generation.
-
-## Authentication layers
-
-There are two independent authentication layers:
-
-1. **Bridge authentication:** optional local `api_keys`.
-2. **Gemini Web authentication:** the local session/cookie file used by the upstream client.
-
-A successful `/v1/models` request proves only that the bridge HTTP layer is reachable; it does not prove Gemini Web authentication.
+Client disconnects close the downstream iterator so the modern backend can cancel the upstream asyncio task rather than continuing generation after the agent has gone away.
 
 ## Docker
 
-Docker remains supported. Mount configuration and authentication files read-only where practical; never bake session material into an image.
+Do not bake cookies or API keys into an image. Mount them at runtime:
 
 ```bash
 docker build -t gemini-agent-bridge .
 docker run --rm -p 8081:8081 \
   -v "$PWD/config.json:/app/config.json:ro" \
+  -v "$PWD/cookies.json:/app/cookies.json:ro" \
   gemini-agent-bridge
 ```
 
-## Troubleshooting
-
-See [`docs/troubleshooting.md`](docs/troubleshooting.md).
-
-| Symptom | Likely layer |
-|---|---|
-| `/v1/models` works, generation says unauthenticated | Gemini Web session |
-| HTTP 405 mentioning `StreamGenerate` | historical legacy process/transport |
-| HTTP 429 from current upstream | upstream throttling/anti-abuse/session/network behavior |
-| 401/403 before upstream request | bridge authentication |
-| port already in use | another server process |
-| stream starts then fails | active stream error-propagation limitation |
-
-When reporting failures, provide redacted status codes, error types, timestamps, and command shape. Never provide cookies, API keys, authorization headers, or session files.
+For a container reachable through the published port, the mounted config must explicitly use a non-loopback bind such as `0.0.0.0` **and** include an API key. The startup guard refuses an unauthenticated remote bind.
 
 ## Verification
 
+Deterministic CI covers Python 3.11–3.14. Local verification:
+
 ```bash
-source .venv/bin/activate
-python -m unittest discover -s tests -p 'test_*.py'
+python -m unittest discover -s tests -p 'test_*.py' -v
 python -m compileall gemini_web2api scripts tests
 git diff --check
 ```
 
-See [`docs/development.md`](docs/development.md) and [`docs/release-status.md`](docs/release-status.md) for the complete verification policy.
+Authenticated live transport smoke test (credentials stay on your machine):
 
-## Project history
+```bash
+python scripts/live_gemini_web_test.py --cookie-file /path/to/gemini-auth.json
+```
 
-The repository has completed the protocol, grounding, recovery, tool-choice, planner, real-client compatibility, trajectory, observability, selective feature-port, stability, and release-verification phases. The current transport repair is a separate gate because real-client testing exposed the stale direct `StreamGenerate` path.
+Real-client validation:
 
-Synthetic tests are not treated as proof of live Gemini Web availability, and model output is never treated as proof that a downstream tool executed.
+```bash
+python scripts/phase8_client_compat.py --opencode --live --cookie-file /path/to/gemini-auth.json
+python scripts/phase8_client_compat.py --hermes --live --cookie-file /path/to/gemini-auth.json
+```
+
+Those commands require the corresponding client to already be installed. They use disposable workspaces and never print the cookie file.
+
+## Troubleshooting
+
+| Symptom | Likely layer |
+|---|---|
+| `/v1/models` works but generation is unauthenticated | Gemini Web session/authentication |
+| `401` on a remote listener | bridge API key |
+| `413` | request body limit |
+| image URL rejected | SSRF/public-address policy |
+| stream ends with an error event and no `[DONE]` | upstream failed after stream commitment |
+| HTTP 405 mentioning `StreamGenerate` | an explicitly legacy transport, not the maintained modern backend |
+| port already in use | another local server process |
+
+When reporting failures, provide status codes, exception **types**, timestamps, and command shape. Never provide cookies, API keys, authorization headers, or session files.
 
 ## License
 
