@@ -19,10 +19,11 @@ class Phase13ReleaseCandidateTests(unittest.TestCase):
 
     def test_release_verifier_is_agent_independent(self):
         text = (ROOT / "scripts/phase13_release_candidate.py").read_text(encoding="utf-8")
-        self.assertIn('agent_claims_used_as_verification', text)
-        self.assertIn('git merge-base --is-ancestor', text.replace('"', ''))
-        self.assertIn('working_tree_clean', text)
-        self.assertIn('real_client_execution', text)
+        self.assertIn("agent_claims_used_as_verification", text)
+        self.assertIn('"merge-base"', text)
+        self.assertIn('"--is-ancestor"', text)
+        self.assertIn("working_tree_clean", text)
+        self.assertIn("real_client_execution", text)
 
 
 if __name__ == "__main__":
