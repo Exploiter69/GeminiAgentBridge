@@ -1,7 +1,7 @@
 """Bounded recovery and explicit error semantics for Phase 5.
 
 This module is deliberately independent of HTTP, Gemini, and downstream tool
-execution.  It classifies failures, decides whether retry is safe, and keeps
+execution. It classifies failures, decides whether retry is safe, and keeps
 failed observations distinguishable from successful empty results.
 """
 from __future__ import annotations
@@ -85,8 +85,8 @@ def classify_http_status(status: int) -> ErrorType:
         return ErrorType.RATE_LIMIT
     if status in (401, 403):
         return ErrorType.AUTHENTICATION
-    if status in (409, 425, 500, 502, 503):
-        return ErrorType.SESSION if status == 503 else ErrorType.UNKNOWN
+    if status == 503:
+        return ErrorType.SESSION
     return ErrorType.UNKNOWN
 
 
@@ -95,7 +95,7 @@ def classify_exception(exc: BaseException) -> Failure:
     import socket
     import urllib.error
 
-    if isinstance(exc, TimeoutError) or isinstance(exc, socket.timeout):
+    if isinstance(exc, (TimeoutError, socket.timeout)):
         return Failure(ErrorType.TIMEOUT, "upstream request timed out")
 
     if isinstance(exc, urllib.error.HTTPError):
@@ -113,6 +113,14 @@ def classify_exception(exc: BaseException) -> Failure:
     message = str(exc).lower()
     if "timeout" in name or "timed out" in message:
         return Failure(ErrorType.TIMEOUT, "upstream request timed out")
+    if "barderrorinfo" in message:
+        if "429" in message or ("rate" in message and "limit" in message):
+            return Failure(ErrorType.RATE_LIMIT, "Gemini upstream rate limit")
+        if "usage" in message and "limit" in message:
+            return Failure(ErrorType.USAGE_LIMIT, "Gemini upstream usage limit")
+        if "401" in message or "403" in message or "unauthorized" in message:
+            return Failure(ErrorType.AUTHENTICATION, "Gemini upstream authentication/session rejected")
+        return Failure(ErrorType.UNKNOWN, "Gemini upstream rejected the request")
     if "rate" in message and "limit" in message:
         return Failure(ErrorType.RATE_LIMIT, "upstream rate limit")
     if "usage" in message and "limit" in message:
@@ -136,6 +144,20 @@ def classify_upstream_text(raw: str) -> Failure | None:
             return Failure(ErrorType.AUTHENTICATION, "Gemini upstream authentication/session rejected")
         return Failure(ErrorType.UNKNOWN, "Gemini upstream rejected the request")
     return None
+
+
+def classify_tool_validation(errors: list[str]) -> Failure | None:
+    """Map protocol/schema validation errors to explicit repair categories."""
+    if not errors:
+        return None
+    joined = " ".join(errors).lower()
+    if "invalid json" in joined or "not parseable" in joined:
+        return Failure(ErrorType.MALFORMED_TOOL_CALL, "tool call could not be parsed")
+    if "required field is missing" in joined:
+        return Failure(ErrorType.MISSING_REQUIRED_ARGUMENT, "tool call is missing a required argument")
+    if "unknown tool" in joined or "unexpected field" in joined or "expected " in joined or "value is not allowed" in joined:
+        return Failure(ErrorType.INVALID_TOOL_SCHEMA, "tool call does not satisfy the declared schema")
+    return Failure(ErrorType.INVALID_TOOL_SCHEMA, "tool call validation failed")
 
 
 def retry_delay(base_delay: float, attempt: int, retry_after: float | None = None, cap: float = 30.0) -> float:
@@ -163,7 +185,7 @@ def run_with_recovery(
     for attempt in range(1, max_attempts + 1):
         try:
             return RetryResult(value=operation(), attempts=attempt)
-        except Exception as exc:  # operation boundary: classify, never fabricate
+        except Exception as exc:
             failure = classify(exc)
             last_failure = failure
             if not failure.retryable or attempt >= max_attempts:
