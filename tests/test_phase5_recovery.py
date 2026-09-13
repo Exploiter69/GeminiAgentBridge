@@ -6,6 +6,7 @@ from gemini_web2api.recovery import (
     ErrorType,
     classify_exception,
     classify_http_status,
+    classify_tool_validation,
     classify_upstream_text,
     failed_tool_observation,
     is_failed_tool_observation,
@@ -21,6 +22,7 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(classify_http_status(429), ErrorType.RATE_LIMIT)
         self.assertEqual(classify_http_status(401), ErrorType.AUTHENTICATION)
         self.assertEqual(classify_http_status(403), ErrorType.AUTHENTICATION)
+        self.assertEqual(classify_http_status(503), ErrorType.SESSION)
         self.assertEqual(classify_http_status(504), ErrorType.TIMEOUT)
 
     def test_timeout_exception_is_retryable(self):
@@ -34,6 +36,16 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(failure.error_type, ErrorType.AUTHENTICATION)
         self.assertFalse(failure.retryable)
 
+    def test_bard_rate_limit_is_retryable(self):
+        failure = classify_exception(RuntimeError("Gemini upstream rejected request: BardErrorInfo [429]"))
+        self.assertEqual(failure.error_type, ErrorType.RATE_LIMIT)
+        self.assertTrue(failure.retryable)
+
+    def test_bard_auth_failure_is_not_retryable(self):
+        failure = classify_exception(RuntimeError("Gemini upstream rejected request: BardErrorInfo [401]"))
+        self.assertEqual(failure.error_type, ErrorType.AUTHENTICATION)
+        self.assertFalse(failure.retryable)
+
     def test_upstream_text_classification_does_not_expose_raw_text(self):
         failure = classify_upstream_text("BardErrorInfo [429] secret-cookie-value")
         self.assertIsNotNone(failure)
@@ -44,6 +56,17 @@ class ClassificationTests(unittest.TestCase):
         failure = classify_upstream_text("   ")
         self.assertEqual(failure.error_type, ErrorType.EMPTY_RESPONSE)
         self.assertTrue(failure.retryable)
+
+    def test_tool_validation_failures_are_repairable(self):
+        malformed = classify_tool_validation(["tool_calls[0].arguments: invalid JSON"])
+        missing = classify_tool_validation(["tool_calls[0].arguments.path: required field is missing"])
+        schema = classify_tool_validation(["tool_calls[0].arguments.mode: value is not allowed"])
+        self.assertEqual(malformed.error_type, ErrorType.MALFORMED_TOOL_CALL)
+        self.assertEqual(missing.error_type, ErrorType.MISSING_REQUIRED_ARGUMENT)
+        self.assertEqual(schema.error_type, ErrorType.INVALID_TOOL_SCHEMA)
+        self.assertTrue(malformed.repairable)
+        self.assertTrue(missing.repairable)
+        self.assertTrue(schema.repairable)
 
 
 class RetryTests(unittest.TestCase):
