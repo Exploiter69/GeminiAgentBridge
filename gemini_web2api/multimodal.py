@@ -1,11 +1,15 @@
-"""Multimodal: Scotty resumable upload for Gemini image input."""
-import json
+"""Multimodal: safe remote-image fetching and Gemini image upload."""
 import base64
-import urllib.request
-import urllib.parse
-import time
-import ssl
+import ipaddress
+import json
 import re
+import socket
+import ssl
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from urllib.parse import urlparse
 
 from .config import CONFIG
@@ -13,7 +17,7 @@ from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
 
 
 def _get_page_tokens() -> dict:
-    """Fetch WIZ_global_data tokens from Gemini page (Push-ID, X-Client-Pctx)."""
+    """Fetch WIZ_global_data tokens from Gemini page."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
@@ -33,31 +37,35 @@ def _get_page_tokens() -> dict:
             resp = opener.open(req, timeout=30)
         else:
             resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        html = resp.read().decode()
+        html = resp.read().decode("utf-8", errors="replace")
         tokens = {}
         for key, pattern in [
             ("push_id", r'"qKIAYe":"([^"]+)"'),
             ("pctx", r'"Ylro7b":"([^"]+)"'),
             ("at", r'"thykhd":"([^"]+)"'),
         ]:
-            m = re.search(pattern, html)
-            if m:
-                tokens[key] = m.group(1)
+            match = re.search(pattern, html)
+            if match:
+                tokens[key] = match.group(1)
         return tokens
-    except Exception as e:
-        log(f"Page token fetch failed: {e}")
+    except Exception as exc:
+        log(f"Page token fetch failed: {type(exc).__name__}")
         return {}
 
 
 _page_tokens_cache = {"tokens": {}, "ts": 0}
+_page_tokens_lock = threading.Lock()
 
 
 def _cached_page_tokens() -> dict:
     now = time.time()
-    if now - _page_tokens_cache["ts"] > 600:
-        _page_tokens_cache["tokens"] = _get_page_tokens()
+    with _page_tokens_lock:
+        if now - _page_tokens_cache["ts"] <= 600 and _page_tokens_cache["tokens"]:
+            return dict(_page_tokens_cache["tokens"])
+        tokens = _get_page_tokens()
+        _page_tokens_cache["tokens"] = tokens
         _page_tokens_cache["ts"] = now
-    return _page_tokens_cache["tokens"]
+        return dict(tokens)
 
 
 def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
@@ -85,8 +93,67 @@ def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
     return fallback
 
 
+def _resolve_public_host(hostname: str) -> None:
+    """Reject loopback, private, link-local, multicast and otherwise unsafe targets."""
+    if not hostname:
+        raise ValueError("image URL has no hostname")
+    try:
+        direct = ipaddress.ip_address(hostname)
+        addresses = [direct]
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise ValueError("image URL hostname could not be resolved") from exc
+        addresses = []
+        for info in infos:
+            try:
+                addresses.append(ipaddress.ip_address(info[4][0]))
+            except ValueError:
+                continue
+    if not addresses:
+        raise ValueError("image URL hostname could not be resolved")
+    for address in addresses:
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+        ):
+            raise ValueError("image URL target is not a public address")
+
+
+def _validate_remote_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("image URL must use http or https")
+    if parsed.username or parsed.password:
+        raise ValueError("image URL credentials are not allowed")
+    _resolve_public_host(parsed.hostname or "")
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_remote_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _image_opener():
+    proxy = CONFIG.get("proxy")
+    handlers = [_SafeRedirectHandler(), urllib.request.HTTPSHandler(context=_get_ssl_ctx())]
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    return urllib.request.build_opener(*handlers)
+
+
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
     """Upload image via Scotty resumable upload. Returns file reference path."""
+    max_bytes = int(CONFIG.get("max_image_bytes", 10 * 1024 * 1024))
+    if not isinstance(image_bytes, bytes) or len(image_bytes) > max_bytes:
+        raise ValueError("image exceeds configured size limit")
+
     tokens = _cached_page_tokens()
     push_id = tokens.get("push_id", "feeds/mcudyrk2a4khkz")
     pctx = tokens.get("pctx", "CgcSBWjK7pYx")
@@ -94,8 +161,6 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     cookie_str, sapisid = load_cookie()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
-
-    # Step 1: Initiate resumable upload
     start_headers = {
         "Push-ID": push_id,
         "X-Tenant-Id": "bard-storage",
@@ -114,11 +179,10 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
 
     start_url = "https://content-push.googleapis.com/upload/"
     req = urllib.request.Request(start_url, data=b"", headers=start_headers, method="POST")
-
     if proxy:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-            urllib.request.HTTPSHandler(context=ctx)
+            urllib.request.HTTPSHandler(context=ctx),
         )
         resp = opener.open(req, timeout=30)
     else:
@@ -126,50 +190,58 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
 
     upload_url = resp.headers.get("X-Goog-Upload-URL") or resp.headers.get("x-goog-upload-url")
     if not upload_url:
-        raise RuntimeError(f"No upload URL in response headers: {dict(resp.headers)}")
+        raise RuntimeError("Gemini upload session did not return an upload URL")
+    # Upload URLs can contain signed session material; never log the URL.
+    log("Upload session started")
 
-    log(f"Upload session started: {upload_url[:80]}...")
-
-    # Step 2: Upload file data + finalize
     upload_headers = {
         "X-Goog-Upload-Command": "upload, finalize",
         "X-Goog-Upload-Offset": "0",
         "Content-Type": "application/octet-stream",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
-
     req2 = urllib.request.Request(upload_url, data=image_bytes, headers=upload_headers, method="POST")
     if proxy:
         resp2 = opener.open(req2, timeout=60)
     else:
         resp2 = urllib.request.urlopen(req2, context=ctx, timeout=60)
 
-    file_ref = resp2.read().decode().strip()
+    file_ref = resp2.read().decode("utf-8", errors="replace").strip()
     if not file_ref or not file_ref.startswith("/"):
-        raise RuntimeError(f"Invalid file reference: {file_ref[:100]}")
-
-    log(f"Image uploaded: {filename} -> {file_ref[:50]}...")
+        raise RuntimeError("Gemini upload returned an invalid file reference")
+    log(f"Image uploaded: {filename}")
     return file_ref
 
 
 def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image from URL."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
-        return b""
+    """Fetch a remote image with SSRF and size protections."""
+    _validate_remote_url(url)
+    max_bytes = int(CONFIG.get("max_image_bytes", 10 * 1024 * 1024))
+    opener = _image_opener()
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
-            )
-            resp = opener.open(req, timeout=30)
-        else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        return resp.read()
-    except Exception as e:
-        log(f"Image fetch failed: {e}")
+        with opener.open(req, timeout=30) as resp:
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > max_bytes:
+                        raise ValueError("remote image exceeds configured size limit")
+                except ValueError as exc:
+                    if str(exc) == "remote image exceeds configured size limit":
+                        raise
+            chunks = []
+            total = 0
+            while True:
+                chunk = resp.read(min(64 * 1024, max_bytes - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("remote image exceeds configured size limit")
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except ValueError:
+        raise
+    except Exception as exc:
+        log(f"Image fetch failed: {type(exc).__name__}")
         return b""
