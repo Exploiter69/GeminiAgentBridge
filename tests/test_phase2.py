@@ -26,14 +26,14 @@ class Phase2ProtocolTests(unittest.TestCase):
             }
         }]
 
-    def test_prompt_prefers_strict_sentinel_protocol(self):
+    def test_prompt_uses_canonical_tool_call_protocol(self):
         prompt, _ = tools.messages_to_prompt(
             [{"role": "user", "content": "run pwd"}], self.tools, "auto"
         )
-        self.assertIn("@@TOOL_CALL@@", prompt)
-        self.assertIn("@@END_TOOL_CALL@@", prompt)
-        self.assertIn("arguments MUST be a JSON object", prompt)
-        self.assertIn("do not use Markdown fences", prompt)
+        self.assertIn("```tool_call", prompt)
+        self.assertIn('"name": "func_name"', prompt)
+        self.assertIn('"arguments": {...}', prompt)
+        self.assertIn("output ONLY the tool_call block(s)", prompt)
 
     def test_schema_validation_rejects_wrong_argument_type(self):
         _, calls = protocol.parse_tool_calls_robust(
@@ -60,18 +60,7 @@ class Phase2ProtocolTests(unittest.TestCase):
         )
         self.assertFalse(protocol.response_needs_repair("", calls, self.tools, "auto"))
 
-    def test_generate_repairs_invalid_tool_call_once(self):
-        invalid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":123}}\n@@END_TOOL_CALL@@'
-        valid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":"pwd"}}\n@@END_TOOL_CALL@@'
-        protocol.set_tool_context(self.tools, "auto")
-        with mock.patch("gemini_web2api._original_generate", side_effect=[invalid, valid]) as upstream:
-            result = server.generate("task", "gemini-3.1-pro", False, None, None)
-        self.assertEqual(result, valid)
-        self.assertEqual(upstream.call_count, 2)
-        self.assertIn("Tool Call Repair", upstream.call_args.args[0])
-        protocol.clear_tool_context()
-
-    def test_chat_completion_returns_openai_tool_call_after_repair(self):
+    def test_chat_completion_returns_openai_tool_call(self):
         original_config = dict(CONFIG)
         CONFIG["api_keys"] = []
         bridge = server.ThreadedServer(("127.0.0.1", 0), server.GeminiHandler)
@@ -79,9 +68,8 @@ class Phase2ProtocolTests(unittest.TestCase):
         bridge.allow_reuse_address = True
         thread.start()
         try:
-            invalid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":123}}\n@@END_TOOL_CALL@@'
-            valid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":"pwd"}}\n@@END_TOOL_CALL@@'
-            with mock.patch("gemini_web2api._original_generate", side_effect=[invalid, valid]) as upstream:
+            valid = '```tool_call\n{"name":"bash","arguments":{"command":"pwd"}}\n```'
+            with mock.patch("gemini_web2api.server.generate", return_value=valid) as upstream:
                 connection = http.client.HTTPConnection("127.0.0.1", bridge.server_address[1], timeout=5)
                 connection.request(
                     "POST",
@@ -102,7 +90,7 @@ class Phase2ProtocolTests(unittest.TestCase):
             self.assertIsNone(message["content"])
             self.assertEqual(message["tool_calls"][0]["function"]["name"], "bash")
             self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {"command": "pwd"})
-            self.assertEqual(upstream.call_count, 2)
+            self.assertEqual(upstream.call_count, 1)
         finally:
             bridge.shutdown()
             bridge.server_close()
