@@ -10,8 +10,10 @@
     "scripting"
   ],
   "host_permissions": [
-    "https://google.com/*",
-    "https://*.google.com/*"
+    "https://gemini.google.com/*",
+    "https://accounts.google.com/*",
+    "https://www.google.com/*",
+    "https://google.com/*"
   ],
   "action": {
     "default_title": "GeminiAgentBridge Session Sync",
