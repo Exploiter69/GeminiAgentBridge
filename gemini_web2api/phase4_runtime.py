@@ -1,4 +1,4 @@
-"""Runtime integration for Phase 4 reliability features."""
+"""Runtime integration for Phase 4 and Phase 5 reliability features."""
 from __future__ import annotations
 
 import json
@@ -12,6 +12,7 @@ from .config import CONFIG
 from .grounding import GroundingFacts
 from .observability import TRACE_HEADER, elapsed_ms, new_trace_id, request_summary, response_summary
 from . import tools as phase4_tools
+from .recovery import classify_exception, classify_upstream_text
 
 _state = threading.local()
 
@@ -38,7 +39,7 @@ def _module_for(cls) -> ModuleType:
 
 
 def install_phase4_runtime(handler_cls) -> None:
-    """Install the same Phase 4 contract on legacy and modular handlers."""
+    """Install the Phase 4/5 contract on legacy and modular handlers."""
     if getattr(handler_cls, "_phase4_installed", False):
         return
 
@@ -142,21 +143,26 @@ def install_phase4_runtime(handler_cls) -> None:
     module.messages_to_prompt = phase4_messages
     module.parse_tool_calls = phase4_tools.parse_tool_calls
 
-    if original_generate and not getattr(module, "_phase4_generate_wrapped", False):
-        def generate_with_empty_recovery(*args, **kwargs):
-            attempts = max(1, min(2, int(CONFIG.get("retry_attempts", 3))))
-            last_raw = None
-            for attempt in range(attempts):
-                last_raw = original_generate(*args, **kwargs)
-                text = module.extract_response_text(last_raw)
-                if text:
-                    return last_raw
-                module.log(f"Phase4: empty upstream response; retry {attempt + 1}/{attempts}")
-                if attempt + 1 < attempts:
-                    time.sleep(float(CONFIG.get("retry_delay_sec", 2)))
-            return last_raw
-        module.gemini_stream_generate = generate_with_empty_recovery
-        module._phase4_generate_wrapped = True
+    if original_generate and not getattr(module, "_phase5_generate_wrapped", False):
+        def generate_with_recovery(*args, **kwargs):
+            try:
+                raw = original_generate(*args, **kwargs)
+            except Exception as exc:
+                failure = classify_exception(exc)
+                module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
+                raise RuntimeError(f"upstream {failure.error_type.value}: {failure.message}") from None
+
+            failure = classify_upstream_text(raw)
+            if failure is not None:
+                if failure.error_type.value == "empty_response":
+                    module.log("Phase5 upstream failure type=empty_response after bounded upstream retries")
+                    raise RuntimeError("upstream empty_response: Gemini returned no usable response")
+                module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
+                raise RuntimeError(f"upstream {failure.error_type.value}: {failure.message}")
+            return raw
+
+        module.gemini_stream_generate = generate_with_recovery
+        module._phase5_generate_wrapped = True
 
     handler_cls._phase4_installed = True
-    module.log(str(request_summary("RUNTIME", "phase4", "installed", 0)))
+    module.log(str(request_summary("RUNTIME", "phase4", "phase4+phase5 installed", 0)))
