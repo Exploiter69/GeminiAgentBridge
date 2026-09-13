@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
 
+import gemini_web2api.gemini as gemini_module
 from gemini_web2api.config import CONFIG
 from gemini_web2api.context import compact_messages
 from gemini_web2api.feature_porting import coerce_tool_call_enums
@@ -52,6 +53,24 @@ class Phase12PerformanceTests(unittest.TestCase):
             self.assertEqual([policy.delay_for_retry(i) for i in range(4)], [1, 3, 7, 7])
         finally:
             CONFIG.update(original)
+
+    def test_idle_reconnect_resets_stale_http_client(self):
+        class FakeClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        original = gemini_module._httpx_client
+        fake = FakeClient()
+        gemini_module._httpx_client = fake
+        try:
+            gemini_module._reset_httpx_client()
+            self.assertTrue(fake.closed)
+            self.assertIsNone(gemini_module._httpx_client)
+        finally:
+            gemini_module._httpx_client = original
 
     def test_context_compaction_preserves_current_task_and_recent_tool_state(self):
         messages = [{"role": "system", "content": "contract"}]
