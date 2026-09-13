@@ -11,6 +11,7 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
@@ -18,7 +19,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Upgrade build tooling
+        run: python -m pip install --upgrade pip setuptools wheel
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements.txt
       - name: Install package
-        run: python -m pip install -e .
+        run: python -m pip install -e . --no-deps
+      - name: Verify dependency graph
+        run: python -m pip check
       - name: Run tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
