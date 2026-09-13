@@ -10,12 +10,12 @@ from urllib.parse import unquote_to_bytes
 from .context import compact_messages
 from .grounding import GroundingFacts
 from .tool_schema import normalize_tool_definitions
+from .protocol import parse_tool_calls_robust
 
-MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
+MAX_IMAGE_B64_SIZE = 50000
 
 
 def _compress_b64_if_needed(b64: str) -> str:
-    """Compress image if base64 is too large for text embedding."""
     if len(b64) <= MAX_IMAGE_B64_SIZE:
         return b64
     try:
@@ -28,14 +28,12 @@ def _compress_b64_if_needed(b64: str) -> str:
             img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
         buf = io.BytesIO()
         img.convert("RGB").save(buf, format="JPEG", quality=60)
-        compressed = base64.b64encode(buf.getvalue()).decode()
-        return compressed
+        return base64.b64encode(buf.getvalue()).decode()
     except Exception:
         return b64[:MAX_IMAGE_B64_SIZE]
 
 
 def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
-    """Build tool_choice constraint instruction."""
     if tool_choice == "none":
         return "\n\nIMPORTANT: Do NOT call any tools. Respond with text only."
     if tool_choice == "required":
@@ -95,25 +93,12 @@ def _image_from_part(part: dict):
     return None
 
 
-def messages_to_prompt(
-    messages: list,
-    tools: list = None,
-    tool_choice=None,
-    grounding: GroundingFacts | None = None,
-    max_chars: int | None = None,
-) -> tuple:
-    """Convert OpenAI messages to (prompt_str, images_list).
-
-    ``grounding`` contains only explicit downstream facts. ``max_chars`` is a
-    configurable soft budget; when set, deterministic compaction preserves the
-    system contract, current task, and recent tool state.
-    """
+def messages_to_prompt(messages: list, tools: list = None, tool_choice=None, grounding: GroundingFacts | None = None, max_chars: int | None = None) -> tuple:
     if max_chars and max_chars > 0:
         messages, _ = compact_messages(messages, max_chars)
 
     parts = []
     images = []
-
     if grounding and grounding.is_explicit:
         parts.append(grounding.to_prompt())
 
@@ -127,14 +112,12 @@ def messages_to_prompt(
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{tool_json}"
-                f"{constraint}"
+                f"Available tools:\n{tool_json}{constraint}"
             )
 
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
-
         if isinstance(content, list):
             text_parts = []
             for c in content:
@@ -146,7 +129,6 @@ def messages_to_prompt(
                         images.append(image)
                         text_parts.append("[Image attached]")
             content = " ".join(text_parts)
-
         if role == "system":
             parts.append(f"[System instruction]: {content}")
         elif role == "assistant":
@@ -154,10 +136,7 @@ def messages_to_prompt(
                 tc_strs = []
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})
-                    tc_strs.append(
-                        f'```tool_call\n{{"name": "{fn.get("name")}", '
-                        f'"arguments": {fn.get("arguments", "{}")}}}\n```'
-                    )
+                    tc_strs.append(f'```tool_call\n{{"name": "{fn.get("name")}", "arguments": {fn.get("arguments", "{}")}}}\n```')
                 parts.append(f"[Assistant]: {content or ''}\n" + "\n".join(tc_strs))
             else:
                 parts.append(f"[Assistant]: {content}")
@@ -166,41 +145,15 @@ def messages_to_prompt(
         else:
             parts.append(content if content else "")
 
-    prompt = "\n\n".join(p for p in parts if p)
-    return prompt, images
+    return "\n\n".join(p for p in parts if p), images
 
 
 def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
-    tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
-    clean_parts = []
-    last_end = 0
-    for m in re.finditer(pattern, text, re.DOTALL):
-        clean_parts.append(text[last_end:m.start()])
-        last_end = m.end()
-        try:
-            data = json.loads(m.group(1).strip())
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                },
-            })
-        except (json.JSONDecodeError, KeyError):
-            pass
-    clean_parts.append(text[last_end:])
-    clean = "".join(clean_parts).strip()
-    return clean, tool_calls
-
-
-# ─── Google Native API helpers ─────────────────────────────────────────────────
+    """Extract tool calls with stable IDs and strict JSON normalization."""
+    return parse_tool_calls_robust(text)
 
 
 def build_tool_prompt(tool_defs: list) -> str:
-    """Build compact, callable tool-use prompt for Gemini Web."""
     compact_defs = normalize_tool_definitions(tool_defs)
     tool_spec = json.dumps(compact_defs, ensure_ascii=False, separators=(",", ":"))
     return (
@@ -220,12 +173,10 @@ def build_tool_prompt(tool_defs: list) -> str:
 
 
 def _google_tool_choice_instruction(req: dict) -> str:
-    """Extract tool_choice constraint from Google API toolConfig."""
     tool_config = req.get("toolConfig", {})
     fc_config = tool_config.get("functionCallingConfig", {})
     mode = fc_config.get("mode", "AUTO")
     allowed = fc_config.get("allowedFunctionNames", [])
-
     if mode == "NONE":
         return "\n\nIMPORTANT: Do NOT call any tools. Respond with text only."
     if mode == "ANY":
@@ -237,13 +188,10 @@ def _google_tool_choice_instruction(req: dict) -> str:
 
 
 def google_contents_to_prompt(req: dict) -> tuple:
-    """Convert Google API contents/tools/systemInstruction to (prompt_str, images_list)."""
     parts = []
     images = []
-
     tool_config = req.get("toolConfig", {})
     fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
-
     tools = req.get("tools")
     tool_defs = []
     if tools and fc_mode != "NONE":
@@ -254,20 +202,13 @@ def google_contents_to_prompt(req: dict) -> tuple:
                 if params:
                     td["parameters"] = params
                 tool_defs.append(td)
-
     sys_inst = req.get("systemInstruction")
     if sys_inst:
-        sys_parts = sys_inst.get("parts", [])
-        sys_text = " ".join(p.get("text", "") for p in sys_parts if p.get("text"))
+        sys_text = " ".join(p.get("text", "") for p in sys_inst.get("parts", []) if p.get("text"))
         if sys_text:
-            if tool_defs:
-                constraint = _google_tool_choice_instruction(req)
-                parts.append(sys_text + "\n\n" + build_tool_prompt(tool_defs) + constraint)
-            else:
-                parts.append(sys_text)
+            parts.append(sys_text + ("\n\n" + build_tool_prompt(tool_defs) + _google_tool_choice_instruction(req) if tool_defs else ""))
     elif tool_defs:
-        constraint = _google_tool_choice_instruction(req)
-        parts.append(build_tool_prompt(tool_defs) + constraint)
+        parts.append(build_tool_prompt(tool_defs) + _google_tool_choice_instruction(req))
 
     for content in req.get("contents", []):
         role = content.get("role", "user")
@@ -278,34 +219,22 @@ def google_contents_to_prompt(req: dict) -> tuple:
             elif p.get("inlineData"):
                 data = p["inlineData"]
                 try:
-                    images.append((
-                        base64.b64decode(data["data"], validate=True),
-                        data.get("mimeType", "image/png"),
-                    ))
+                    images.append((base64.b64decode(data["data"], validate=True), data.get("mimeType", "image/png")))
                     msg_parts.append("[Image attached]")
                 except (KeyError, ValueError, TypeError, binascii.Error):
                     pass
             elif p.get("functionCall"):
                 fc = p["functionCall"]
-                msg_parts.append(
-                    f'```function_call\n{json.dumps({"name": fc["name"], "args": fc.get("args", {})}, ensure_ascii=False)}\n```'
-                )
+                msg_parts.append(f'```function_call\n{json.dumps({"name": fc["name"], "args": fc.get("args", {})}, ensure_ascii=False)}\n```')
             elif p.get("functionResponse"):
                 fr = p["functionResponse"]
-                msg_parts.append(
-                    f'[Tool result for {fr.get("name", "")}]: {json.dumps(fr.get("response", {}), ensure_ascii=False)}'
-                )
+                msg_parts.append(f'[Tool result for {fr.get("name", "")}]: {json.dumps(fr.get("response", {}), ensure_ascii=False)}')
         text = "\n".join(msg_parts)
-        if role == "model":
-            parts.append(f"[Assistant]: {text}")
-        else:
-            parts.append(text)
-
+        parts.append(f"[Assistant]: {text}" if role == "model" else text)
     return "\n\n".join(p for p in parts if p), images
 
 
 def parse_google_function_calls(text: str) -> tuple:
-    """Extract function_call blocks from model output."""
     function_calls = []
     pattern1 = r'```function_call\s*\n(.*?)\n```'
     pattern2 = r'(?:^|\n)function_call\s*\n(\{[^`]*?\})'
@@ -315,10 +244,7 @@ def parse_google_function_calls(text: str) -> tuple:
             try:
                 data = json.loads(match.strip())
                 if "name" in data:
-                    function_calls.append({
-                        "name": data["name"],
-                        "args": data.get("args", data.get("arguments", {})),
-                    })
+                    function_calls.append({"name": data["name"], "args": data.get("args", data.get("arguments", {}))})
             except (json.JSONDecodeError, KeyError):
                 pass
         clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
@@ -326,10 +252,7 @@ def parse_google_function_calls(text: str) -> tuple:
         try:
             data = json.loads(clean.strip())
             if "name" in data and ("args" in data or "arguments" in data):
-                function_calls.append({
-                    "name": data["name"],
-                    "args": data.get("args", data.get("arguments", {})),
-                })
+                function_calls.append({"name": data["name"], "args": data.get("args", data.get("arguments", {}))})
                 clean = ""
         except (json.JSONDecodeError, KeyError):
             pass
