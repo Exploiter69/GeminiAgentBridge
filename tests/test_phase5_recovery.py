@@ -16,7 +16,7 @@ from gemini_web2api.recovery import (
     retry_delay,
     run_with_recovery,
 )
-from gemini_web2api.phase4_runtime import install_phase4_runtime
+from gemini_web2api.phase4_runtime import _state, install_phase4_runtime
 
 
 class ClassificationTests(unittest.TestCase):
@@ -140,6 +140,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
         return module, DummyHandler
 
     def tearDown(self):
+        for attr in ("grounding", "tool_defs", "tool_choice"):
+            if hasattr(_state, attr):
+                delattr(_state, attr)
         sys.modules.pop("_phase5_fake_server", None)
 
     def test_runtime_wraps_actual_modular_generate(self):
@@ -160,6 +163,59 @@ class RuntimeIntegrationTests(unittest.TestCase):
         module, _ = self._install_with(lambda *_a, **_k: "BardErrorInfo [429]")
         with self.assertRaisesRegex(RuntimeError, "upstream rate_limit"):
             module.generate("prompt")
+
+    def test_runtime_repairs_missing_required_argument_once(self):
+        calls = []
+        invalid = '@@TOOL_CALL@@\n{"name":"read_file","arguments":{}}\n@@END_TOOL_CALL@@'
+        valid = '@@TOOL_CALL@@\n{"name":"read_file","arguments":{"path":"sample.txt"}}\n@@END_TOOL_CALL@@'
+
+        def generate(prompt, *_args, **_kwargs):
+            calls.append(prompt)
+            return invalid if len(calls) == 1 else valid
+
+        module, _ = self._install_with(generate)
+        _state.tool_defs = [{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+            },
+        }]
+        _state.tool_choice = "auto"
+        result = module.generate("Read sample.txt")
+        self.assertEqual(result, valid)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("required field is missing", calls[1])
+
+    def test_runtime_does_not_retry_tool_repair_indefinitely(self):
+        calls = []
+        invalid = '@@TOOL_CALL@@\n{"name":"read_file","arguments":{}}\n@@END_TOOL_CALL@@'
+
+        def generate(prompt, *_args, **_kwargs):
+            calls.append(prompt)
+            return invalid
+
+        module, _ = self._install_with(generate)
+        _state.tool_defs = [{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }]
+        _state.tool_choice = "auto"
+        with self.assertRaisesRegex(RuntimeError, "tool_call_recovery_failed: missing_required_argument"):
+            module.generate("Read sample.txt")
+        self.assertEqual(len(calls), 2)
 
 
 class ToolObservationTests(unittest.TestCase):
