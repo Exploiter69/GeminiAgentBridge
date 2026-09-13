@@ -1,6 +1,6 @@
 {
   "port": 8081,
-  "host": "0.0.0.0",
+  "host": "127.0.0.1",
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "retry_backoff_multiplier": 2.0,
@@ -16,5 +16,10 @@
   "proxy": null,
   "log_requests": true,
   "temporary_chats": false,
-  "prompt_soft_budget_chars": 0
+  "prompt_soft_budget_chars": 0,
+  "tool_schema_budget_chars": 30000,
+  "tool_repair_attempts": 1,
+  "max_request_body_bytes": 4194304,
+  "max_image_bytes": 10485760,
+  "max_image_redirects": 3
 }
