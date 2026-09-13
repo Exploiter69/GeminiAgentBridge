@@ -10,7 +10,7 @@ from urllib.parse import unquote_to_bytes
 from .context import compact_messages
 from .grounding import GroundingFacts
 from .tool_schema import normalize_tool_definitions
-from .protocol import parse_tool_calls_robust
+from .protocol import parse_tool_calls_robust, set_tool_context, get_tool_context, validate_tool_calls, validate_tool_choice, clear_tool_context
 
 MAX_IMAGE_B64_SIZE = 50000
 
@@ -94,6 +94,8 @@ def _image_from_part(part: dict):
 
 
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None, grounding: GroundingFacts | None = None, max_chars: int | None = None) -> tuple:
+    tool_defs = normalize_tool_definitions(tools or []) if tools else []
+    set_tool_context(tool_defs, tool_choice if tool_choice is not None else "auto")
     if max_chars and max_chars > 0:
         messages, _ = compact_messages(messages, max_chars)
 
@@ -102,18 +104,16 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None, gro
     if grounding and grounding.is_explicit:
         parts.append(grounding.to_prompt())
 
-    if tools and tool_choice != "none":
-        tool_defs = normalize_tool_definitions(tools)
-        if tool_defs:
-            constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
-            tool_json = json.dumps(tool_defs, ensure_ascii=False, separators=(",", ":"))
-            parts.append(
-                "# Tool Use\n\n"
-                "You can call the following tools. Call format:\n"
-                '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{tool_json}{constraint}"
-            )
+    if tool_defs and tool_choice != "none":
+        constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
+        tool_json = json.dumps(tool_defs, ensure_ascii=False, separators=(",", ":"))
+        parts.append(
+            "# Tool Use\n\n"
+            "You can call the following tools. Call format:\n"
+            '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
+            "When calling tools, output ONLY the tool_call block(s).\n\n"
+            f"Available tools:\n{tool_json}{constraint}"
+        )
 
     for msg in messages:
         role = msg.get("role", "user")
@@ -149,8 +149,20 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None, gro
 
 
 def parse_tool_calls(text: str) -> tuple:
-    """Extract tool calls with stable IDs and strict JSON normalization."""
-    return parse_tool_calls_robust(text)
+    """Extract and validate tool calls against the declarations for this request."""
+    clean, calls = parse_tool_calls_robust(text)
+    tool_defs, tool_choice = get_tool_context()
+    errors = validate_tool_choice(tool_choice, tool_defs)
+    errors.extend(validate_tool_calls(calls, tool_defs))
+    if tool_choice == "none" and calls:
+        errors.append("tool_choice=none forbids tool calls")
+    if tool_choice == "required" and not calls:
+        errors.append("tool_choice=required requires at least one tool call")
+    if errors:
+        clear_tool_context()
+        raise ValueError("invalid tool call protocol: " + "; ".join(errors[:8]))
+    clear_tool_context()
+    return clean, calls
 
 
 def build_tool_prompt(tool_defs: list) -> str:
