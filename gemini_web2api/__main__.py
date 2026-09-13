@@ -31,8 +31,10 @@ def main():
 
     from .phase4_runtime import install_phase4_runtime
     from .phase10_observability import install_phase10_observability
+    from .phase11_feature_porting import install_phase11_feature_porting
 
     install_phase4_runtime(GeminiHandler)
+    install_phase11_feature_porting()
     install_phase10_observability(GeminiHandler)
 
     port = CONFIG["port"]
@@ -46,6 +48,7 @@ def main():
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print("  Observability: structured, credential-redacted lifecycle events")
+    print("  Feature ports: conservative enum coercion")
     print()
     try:
         server.serve_forever()
