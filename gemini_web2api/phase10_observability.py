@@ -12,15 +12,9 @@ import threading
 import time
 from types import ModuleType
 
-from .observability import (
-    TRACE_HEADER,
-    elapsed_ms,
-    emit_event,
-    event_json,
-    new_trace_id,
-    safe_tool_names,
-)
+from .observability import elapsed_ms, emit_event, event_json, new_trace_id, safe_tool_names
 from .protocol import validate_tool_calls
+from . import phase4_runtime
 
 _state = threading.local()
 
@@ -36,10 +30,6 @@ def _trace_id() -> str | None:
 def _log(module: ModuleType, trace_id: str, event: str, **fields) -> None:
     event_obj = emit_event(trace_id, event, **fields)
     module.log(event_json(event_obj))
-
-
-def _request(req: dict | None) -> dict:
-    return req if isinstance(req, dict) else {}
 
 
 def install_phase10_observability(handler_cls) -> None:
@@ -65,20 +55,16 @@ def install_phase10_observability(handler_cls) -> None:
         return body
 
     def do_post(self, *args, **kwargs):
-        # Phase 4 creates the canonical trace ID. We reuse it after original_post
-        # has initialized the request, while retaining a pre-request correlation ID
-        # only when a handler implementation does not provide one.
         result = original_post(self, *args, **kwargs)
         trace_id = getattr(self, "_phase4_trace_id", None) or new_trace_id()
         self._phase10_trace_id = trace_id
         _state.trace_id = trace_id
         try:
             status = int(getattr(self, "_phase4_status", 200))
-            event = "request_completed" if status < 500 else "request_failed"
             _log(
                 module,
                 trace_id,
-                event,
+                "request_completed" if status < 500 else "request_failed",
                 method="POST",
                 path=getattr(self, "path", "").split("?", 1)[0],
                 status=status,
@@ -118,14 +104,7 @@ def install_phase10_observability(handler_cls) -> None:
             req = {}
         trace_id = getattr(self, "_phase4_trace_id", None) or new_trace_id()
         _state.trace_id = trace_id
-        _log(
-            module,
-            trace_id,
-            "request_received",
-            method="POST",
-            path="/v1/chat/completions",
-            body_bytes=len(body or b"") if isinstance(body, (bytes, bytearray)) else 0,
-        )
+        _log(module, trace_id, "request_received", method="POST", path="/v1/chat/completions", body_bytes=len(body or b"") if isinstance(body, (bytes, bytearray)) else 0)
         _log(
             module,
             trace_id,
@@ -135,8 +114,7 @@ def install_phase10_observability(handler_cls) -> None:
             tool_choice=str(req.get("tool_choice", "auto")) if isinstance(req, dict) else "auto",
             grounding_explicit=bool((req.get("metadata") or {}).get("grounding")) if isinstance(req, dict) else False,
         )
-        result = original_chat(self, body, *args, **kwargs) if original_chat else None
-        return result
+        return original_chat(self, body, *args, **kwargs) if original_chat else None
 
     def handle_responses(self, body, *args, **kwargs):
         try:
@@ -145,14 +123,7 @@ def install_phase10_observability(handler_cls) -> None:
             req = {}
         trace_id = getattr(self, "_phase4_trace_id", None) or new_trace_id()
         _state.trace_id = trace_id
-        _log(
-            module,
-            trace_id,
-            "request_received",
-            method="POST",
-            path="/v1/responses",
-            body_bytes=len(body or b"") if isinstance(body, (bytes, bytearray)) else 0,
-        )
+        _log(module, trace_id, "request_received", method="POST", path="/v1/responses", body_bytes=len(body or b"") if isinstance(body, (bytes, bytearray)) else 0)
         input_items = req.get("input", []) if isinstance(req, dict) else []
         observation_count = 0
         if isinstance(input_items, list):
@@ -171,7 +142,7 @@ def install_phase10_observability(handler_cls) -> None:
         )
         return original_responses(self, body, *args, **kwargs) if original_responses else None
 
-    def handle_google(self, body, stream, *args, **kwargs):
+    def handle_google(body, stream, *args, **kwargs):
         trace_id = getattr(self, "_phase4_trace_id", None) or new_trace_id()
         _state.trace_id = trace_id
         _log(module, trace_id, "request_received", method="POST", path=getattr(self, "path", "").split("?", 1)[0], body_bytes=len(body or b""))
@@ -182,14 +153,7 @@ def install_phase10_observability(handler_cls) -> None:
         trace_id = _trace_id()
         if trace_id:
             prompt_text, images = result
-            _log(
-                module,
-                trace_id,
-                "prompt_built",
-                prompt_chars=len(prompt_text or ""),
-                image_count=len(images or []),
-                tool_count=len(tools or []),
-            )
+            _log(module, trace_id, "prompt_built", prompt_chars=len(prompt_text or ""), image_count=len(images or []), tool_count=len(tools or []))
         return result
 
     def parse_calls(text, *args, **kwargs):
@@ -200,8 +164,7 @@ def install_phase10_observability(handler_cls) -> None:
         if trace_id:
             names = safe_tool_names(calls)
             _log(module, trace_id, "parsed_tool_call", count=len(calls or []), tool_names=names)
-            tool_defs = getattr(getattr(module, "_state", None), "tool_defs", None)
-            # Validation is observational only; Phase 4 remains the authority.
+            tool_defs, _ = phase4_runtime._current_tool_context()
             if tool_defs:
                 errors = validate_tool_calls(calls, tool_defs)
                 _log(module, trace_id, "schema_validation", status="pass" if not errors else "fail", error_count=len(errors), tool_names=names)
