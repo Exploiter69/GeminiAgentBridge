@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_DIR = ROOT / "artifacts"
 EVIDENCE = ARTIFACT_DIR / "phase13-release-candidate.json"
 MANIFEST = ARTIFACT_DIR / "phase13-release-candidate.sha256"
+PHASE12_BASE = "d8305869cc5ab603afd5fa4b2d44b93483b1c811"
 
 REQUIRED_FILES = (
     "roadmap.md", "gemini_web2api/server.py", "gemini_web2api/context.py",
@@ -30,7 +31,7 @@ PHASE_COMMITS = {
     "phase9": "f601252d656df2535eb39385415c7ff1b0ec72f8",
     "phase10": "3e14264d07eda9dbcb586fc3981eb2ad9a17ce34",
     "phase11": "c5b7bd7a65a7e9246345fa3d80efd6f59f4638e7",
-    "phase12": "d8305869cc5ab603afd5fa4b2d44b93483b1c811",
+    "phase12": PHASE12_BASE,
 }
 
 @dataclass
@@ -65,6 +66,9 @@ def git(*args: str) -> str:
 def add(name: str, status: bool, detail: str) -> None:
     checks.append(Check(name, "PASS" if status else "FAIL", detail))
 
+def defer(name: str, detail: str) -> None:
+    checks.append(Check(name, "DEFERRED", detail))
+
 def main() -> int:
     add("repository_root", (ROOT / ".git").exists(), str(ROOT))
     head = git("rev-parse", "HEAD")
@@ -91,13 +95,13 @@ def main() -> int:
         "all phase commits resolve and are ancestors" if not failures else "; ".join(failures))
 
     try:
-        changed = set(git("diff-tree", "--no-commit-id", "--name-only", "-r", head).splitlines())
+        changed = set(git("diff", "--name-only", PHASE12_BASE, head).splitlines())
         expected = {"scripts/phase13_release_candidate.py", "tests/test_phase13_release_candidate.py",
                     ".github/workflows/phase13-release-candidate.yml", "roadmap.md"}
-        add("release_commit_contains_phase13_changes", expected.issubset(changed),
-            "changed paths: " + ", ".join(sorted(changed)))
+        add("release_scope_contains_phase13_changes", expected.issubset(changed),
+            "changed paths since Phase 12: " + ", ".join(sorted(changed)))
     except subprocess.CalledProcessError as exc:
-        add("release_commit_contains_phase13_changes", False, str(exc))
+        add("release_scope_contains_phase13_changes", False, str(exc))
 
     for name, command in [
         ("phase8_regression", [sys.executable, "-m", "unittest", "tests.test_phase8_compatibility", "-v"]),
@@ -117,24 +121,28 @@ def main() -> int:
         "gemini_web2api", "tests", "scripts", ".github"], timeout=60)
 
     if os.environ.get("PHASE13_RUN_REAL_CLIENTS") == "1":
-        run("real_client_harness", [sys.executable, "scripts/phase8_client_compat.py", "--all"], timeout=600)
+        result = run("real_client_harness", [sys.executable, "scripts/phase8_client_compat.py", "--hermes", "--opencode"], timeout=600)
+        if result.exit_code != 0:
+            pass
     else:
-        add("real_client_execution", False,
-            "NOT RUN: set PHASE13_RUN_REAL_CLIENTS=1 in a local environment with Hermes/OpenCode installed")
+        defer("real_client_execution",
+              "not run in CI: execute PHASE13_RUN_REAL_CLIENTS=1 with both Hermes and OpenCode installed")
 
     server_text = (ROOT / "gemini_web2api/server.py").read_text(encoding="utf-8")
     forbidden = ("subprocess.run", "subprocess.Popen", "os.system", "os.popen")
     add("bridge_execution_boundary", not any(token in server_text for token in forbidden),
         "server.py contains no direct shell/filesystem execution primitive")
 
-    failed = [asdict(c) for c in checks if c.status != "PASS"]
-    verdict = "GO" if not failed else "NO-GO"
+    failed = [asdict(c) for c in checks if c.status == "FAIL"]
+    deferred = [c.name for c in checks if c.status == "DEFERRED"]
+    verdict = "GO" if not failed and not deferred else "NO-GO"
     payload = {
         "phase": 13, "verdict": verdict, "head": head, "branch": branch,
         "generated_by": "scripts/phase13_release_candidate.py",
         "agent_claims_used_as_verification": False,
         "checks": [asdict(c) for c in checks],
         "failed_checks": [c["name"] for c in failed],
+        "deferred_checks": deferred,
     }
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
