@@ -1,16 +1,20 @@
 [project]
-name = "gemini-web2api"
-version = "1.1.0"
-description = "Convert Google Gemini web into OpenAI-compatible API"
+name = "gemini-agent-bridge"
+version = "2.0.0"
+description = "Gemini Web reasoning bridge with an OpenAI-compatible local API for agent clients"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.25",
+  "gemini-webapi==2.1.1",
+]
 
 [project.optional-dependencies]
-streaming = ["httpx>=0.25"]
+test = ["pytest>=8"]
 
 [project.scripts]
+gemini-agent-bridge = "gemini_web2api.__main__:main"
 gemini-web2api = "gemini_web2api.__main__:main"
 
 [build-system]
