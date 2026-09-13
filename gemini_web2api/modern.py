@@ -35,10 +35,10 @@ class _ModernBackend:
         self._started = threading.Event()
 
     def _ensure_loop(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self._thread and self._thread.is_alive() and self._loop and not self._loop.is_closed():
             return
         with self._lock:
-            if self._thread and self._thread.is_alive():
+            if self._thread and self._thread.is_alive() and self._loop and not self._loop.is_closed():
                 return
 
             def runner() -> None:
@@ -221,13 +221,26 @@ class _ModernBackend:
             yield item
 
     def shutdown(self) -> None:
-        if not self._loop or not self._thread:
+        loop = self._loop
+        thread = self._thread
+        if not loop or not thread:
+            return
+        if loop.is_closed() or not thread.is_alive():
+            self._loop = None
+            self._thread = None
+            self._client = None
             return
         try:
             self._run(self._close_client(), timeout=10)
         except Exception:
             pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5)
+        self._loop = None
+        self._thread = None
+        self._client = None
 
 
 _BACKEND = _ModernBackend()
