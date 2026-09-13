@@ -121,12 +121,13 @@ def messages_to_prompt(
         tool_defs = normalize_tool_definitions(tools)
         if tool_defs:
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
+            tool_json = json.dumps(tool_defs, ensure_ascii=False, separators=(",", ":"))
             parts.append(
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, ensure_ascii=False, separators=(",", ":"))}"
+                f"Available tools:\n{tool_json}"
                 f"{constraint}"
             )
 
