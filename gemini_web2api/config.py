@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "temporary_chats": False,
     # 0 disables compaction until a measured deployment budget is selected.
     "prompt_soft_budget_chars": 0,
+    "tool_schema_budget_chars": 30000,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

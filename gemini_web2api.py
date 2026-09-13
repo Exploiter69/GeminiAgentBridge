@@ -1085,6 +1085,9 @@ def main():
         daemon_threads = True
         allow_reuse_address = True
 
+    from gemini_web2api.phase4_runtime import install_phase4_runtime
+    install_phase4_runtime(GeminiHandler)
+
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
     print(f"gemini-web2api v{__version__}")

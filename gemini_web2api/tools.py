@@ -9,6 +9,7 @@ from urllib.parse import unquote_to_bytes
 
 from .context import compact_messages
 from .grounding import GroundingFacts
+from .tool_schema import normalize_tool_definitions
 
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
 
@@ -117,14 +118,7 @@ def messages_to_prompt(
         parts.append(grounding.to_prompt())
 
     if tools and tool_choice != "none":
-        tool_defs = []
-        for tool in tools:
-            fn = tool.get("function", tool) if tool.get("type") == "function" else tool
-            tool_defs.append({
-                "name": fn.get("name", tool.get("name", "")),
-                "description": fn.get("description", tool.get("description", "")),
-                "parameters": fn.get("parameters", tool.get("parameters", {})),
-            })
+        tool_defs = normalize_tool_definitions(tools)
         if tool_defs:
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
             parts.append(
@@ -132,7 +126,7 @@ def messages_to_prompt(
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"Available tools:\n{json.dumps(tool_defs, ensure_ascii=False, separators=(",", ":"))}"
                 f"{constraint}"
             )
 
