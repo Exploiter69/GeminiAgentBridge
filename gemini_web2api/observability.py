@@ -21,6 +21,10 @@ _SECRET_KEY_RE = re.compile(
     r"(?:authorization|cookie|set-cookie|api[_-]?key|token|secret|password|session|xsrf|credential)",
     re.I,
 )
+_CONTENT_KEY_RE = re.compile(
+    r"^(?:arguments?|request|response|body|content|prompt|input|output|raw)$",
+    re.I,
+)
 _SECRET_QUERY_RE = re.compile(
     r"([?&](?:key|api[_-]?key|token|access_token|auth|session)=)[^&\s]+",
     re.I,
@@ -74,7 +78,7 @@ def safe_tool_names(tool_calls: Iterable[dict] | None) -> list[str]:
 
 
 def _safe_value(key: str, value: Any) -> Any:
-    if _SECRET_KEY_RE.search(key):
+    if _SECRET_KEY_RE.search(key) or _CONTENT_KEY_RE.fullmatch(key):
         return "[REDACTED]"
     if isinstance(value, dict):
         return {str(k): _safe_value(str(k), v) for k, v in value.items()}
@@ -89,7 +93,7 @@ def _safe_value(key: str, value: Any) -> Any:
 
 
 def sanitize_event(fields: dict[str, Any]) -> dict[str, Any]:
-    """Return a bounded event with credential-bearing keys/URLs redacted."""
+    """Return a bounded event with credential/content-bearing keys redacted."""
     return {str(k): _safe_value(str(k), v) for k, v in fields.items()}
 
 
