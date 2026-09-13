@@ -29,22 +29,27 @@ STRICT_TOOL_PROTOCOL = (
 _REPAIR_PREFIX = (
     "# Tool Call Repair\n\n"
     "Your previous response contained an invalid tool call. Correct it and retry.\n"
+    "Do not invent a new task or tool intent. Preserve the user's original request.\n"
     "Output ONLY the corrected @@TOOL_CALL@@ block(s), with no Markdown fences or prose.\n"
 )
 
 _tool_context = threading.local()
 
+
 def set_tool_context(tool_defs: list[dict[str, Any]] | None, tool_choice: Any = "auto") -> None:
     _tool_context.tool_defs = tool_defs or []
     _tool_context.tool_choice = tool_choice
 
+
 def get_tool_context() -> tuple[list[dict[str, Any]], Any]:
     return getattr(_tool_context, "tool_defs", []), getattr(_tool_context, "tool_choice", "auto")
+
 
 def clear_tool_context() -> None:
     for attr in ("tool_defs", "tool_choice"):
         if hasattr(_tool_context, attr):
             delattr(_tool_context, attr)
+
 
 def _candidate_objects(text: str) -> list[tuple[int, int, str]]:
     found: list[tuple[int, int, str]] = []
@@ -53,6 +58,7 @@ def _candidate_objects(text: str) -> list[tuple[int, int, str]]:
             found.append((match.start(), match.end(), match.group("body")))
     found.sort(key=lambda item: item[0])
     return found
+
 
 def _decode_object(raw: str) -> dict[str, Any] | None:
     raw = raw.strip()
@@ -70,6 +76,7 @@ def _decode_object(raw: str) -> dict[str, Any] | None:
             return None
     return obj if isinstance(obj, dict) else None
 
+
 def _normalize(obj: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     name = obj.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -85,6 +92,7 @@ def _normalize(obj: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     if not isinstance(arguments, dict):
         return None
     return name.strip(), arguments
+
 
 def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
     if not text:
@@ -114,6 +122,7 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
         clean = clean[:start] + clean[end:]
     return clean.strip(), calls
 
+
 def _schema_type_ok(value: Any, schema_type: str) -> bool:
     return {
         "object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str),
@@ -121,6 +130,7 @@ def _schema_type_ok(value: Any, schema_type: str) -> bool:
         "number": isinstance(value, (int, float)) and not isinstance(value, bool),
         "boolean": isinstance(value, bool), "null": value is None,
     }.get(schema_type, True)
+
 
 def _validate_value(value: Any, schema: dict[str, Any], path: str) -> list[str]:
     errors: list[str] = []
@@ -149,6 +159,7 @@ def _validate_value(value: Any, schema: dict[str, Any], path: str) -> list[str]:
         errors.append(f"{path}: string is too short")
     return errors
 
+
 def _tool_def_map(tool_defs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     result = {}
     for tool in tool_defs or []:
@@ -156,6 +167,7 @@ def _tool_def_map(tool_defs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if isinstance(fn.get("name"), str) and fn["name"]:
             result[fn["name"]] = fn
     return result
+
 
 def validate_tool_calls(tool_calls: list[dict[str, Any]], tool_defs: list[dict[str, Any]] | None = None) -> list[str]:
     defs = _tool_def_map(tool_defs or [])
@@ -177,10 +189,66 @@ def validate_tool_calls(tool_calls: list[dict[str, Any]], tool_defs: list[dict[s
         errors.extend(_validate_value(arguments, defs[name].get("parameters", {}) or {}, f"tool_calls[{index}].arguments"))
     return errors
 
-def response_needs_repair(text: str, tool_calls: list[dict[str, Any]], tool_defs: list[dict[str, Any]], tool_choice: Any = "auto") -> bool:
-    attempted = any(marker in (text or "") for marker in ("@@TOOL_CALL@@", "```tool_call", "\ntool_call\n"))
-    return (attempted and not tool_calls) or bool(validate_tool_calls(tool_calls, tool_defs)) or (tool_choice == "required" and not tool_calls)
 
-def build_repair_prompt(original_prompt: str, errors: list[str]) -> str:
+def tool_choice_name(tool_choice: Any) -> str | None:
+    """Return the explicitly requested function name, if any."""
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        fn = tool_choice.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"].strip():
+            return fn["name"].strip()
+    return None
+
+
+def validate_tool_choice(tool_choice: Any, tool_defs: list[dict[str, Any]] | None = None) -> list[str]:
+    """Validate OpenAI tool_choice without inferring or inventing tool intent."""
+    if tool_choice in (None, "auto", "none", "required"):
+        if tool_choice == "required" and not tool_defs:
+            return ["tool_choice=required cannot be satisfied without tools"]
+        return []
+    if not isinstance(tool_choice, dict) or tool_choice.get("type") != "function":
+        return ["tool_choice must be one of auto, none, required, or a function choice"]
+    name = tool_choice_name(tool_choice)
+    if not name:
+        return ["tool_choice function name is missing"]
+    if name not in _tool_def_map(tool_defs or []):
+        return [f"tool_choice requested unknown tool '{name}'"]
+    return []
+
+
+def _attempted_tool_marker(text: str) -> bool:
+    return any(marker in (text or "") for marker in ("@@TOOL_CALL@@", "```tool_call", "\ntool_call\n"))
+
+
+def response_needs_repair(text: str, tool_calls: list[dict[str, Any]], tool_defs: list[dict[str, Any]], tool_choice: Any = "auto") -> bool:
+    attempted = _attempted_tool_marker(text)
+    validation_errors = validate_tool_calls(tool_calls, tool_defs)
+
+    if tool_choice == "none":
+        # Explicit client intent: no tool call may cross the protocol boundary.
+        return attempted or bool(tool_calls)
+
+    requested = tool_choice_name(tool_choice)
+    if requested:
+        if not tool_calls:
+            return True
+        if any(call.get("function", {}).get("name") != requested for call in tool_calls):
+            return True
+
+    return (
+        (attempted and not tool_calls)
+        or bool(validation_errors)
+        or (tool_choice == "required" and not tool_calls)
+    )
+
+
+def build_repair_prompt(original_prompt: str, errors: list[str], tool_choice: Any = "auto", tool_defs: list[dict[str, Any]] | None = None) -> str:
     details = "\n".join(f"- {error}" for error in errors[:8]) or "- tool call was not parseable"
-    return f"{original_prompt}\n\n{_REPAIR_PREFIX}{details}\n"
+    if tool_choice == "none":
+        constraint = "\nTool-choice constraint: NONE. Do not emit any tool call. Return text only.\n"
+    elif tool_choice == "required":
+        constraint = "\nTool-choice constraint: REQUIRED. Produce a tool call supported by the user's request and the declared tools.\n"
+    elif tool_choice_name(tool_choice):
+        constraint = f"\nTool-choice constraint: use ONLY the explicitly requested tool '{tool_choice_name(tool_choice)}'. Do not substitute another tool.\n"
+    else:
+        constraint = ""
+    return f"{original_prompt}\n\n{_REPAIR_PREFIX}{constraint}{details}\n"
