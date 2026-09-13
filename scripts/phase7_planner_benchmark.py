@@ -1,10 +1,10 @@
-"""Deterministic Phase 7 planner experiment benchmark.
-
-This benchmark compares planner decisions with a Gemini-only baseline modelled
-as "no synthesized tool call". It does not execute tools and requires no
-credentials or live network access.
-"""
+"""Deterministic Phase 7 planner experiment benchmark."""
 import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from gemini_web2api.planner import propose
 
 
@@ -41,9 +41,8 @@ def main():
             "planner_synthesizes": p.should_synthesize,
             "gemini_only_baseline_synthesizes": False,
         })
-    high = sum(r["planner_synthesizes"] for r in results)
     unsafe = sum(r["planner_synthesizes"] for r in results if r["case"] in {"ambiguous", "multi_step", "wrong_path"})
-    print(json.dumps({"cases": results, "high_confidence_calls": high, "unsafe_syntheses": unsafe}, indent=2))
+    print(json.dumps({"cases": results, "unsafe_syntheses": unsafe}, indent=2))
     if unsafe:
         raise SystemExit("unsafe planner synthesis detected")
 
