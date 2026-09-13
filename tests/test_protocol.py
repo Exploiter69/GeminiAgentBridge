@@ -2,6 +2,7 @@ import json
 import unittest
 
 from gemini_web2api.protocol import parse_tool_calls_robust
+from gemini_web2api.tools import messages_to_prompt, parse_tool_calls
 
 
 class ToolProtocolTests(unittest.TestCase):
@@ -20,10 +21,7 @@ class ToolProtocolTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["name"], "bash")
 
     def test_multiple_calls_preserve_order(self):
-        text = (
-            '@@TOOL_CALL@@\n{"name":"a","arguments":{}}\n@@END_TOOL_CALL@@\n'
-            '@@TOOL_CALL@@\n{"name":"b","arguments":{"x":1}}\n@@END_TOOL_CALL@@'
-        )
+        text = '@@TOOL_CALL@@\n{"name":"a","arguments":{}}\n@@END_TOOL_CALL@@\n@@TOOL_CALL@@\n{"name":"b","arguments":{"x":1}}\n@@END_TOOL_CALL@@'
         _, calls = parse_tool_calls_robust(text)
         self.assertEqual([c["function"]["name"] for c in calls], ["a", "b"])
 
@@ -55,6 +53,25 @@ class ToolProtocolTests(unittest.TestCase):
         _, first = parse_tool_calls_robust(text)
         _, second = parse_tool_calls_robust(text)
         self.assertEqual(first[0]["id"], second[0]["id"])
+
+    def test_declared_schema_is_enforced(self):
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}}}}]
+        messages_to_prompt([{"role": "user", "content": "read"}], tools, "auto")
+        clean, calls = parse_tool_calls('```tool_call\n{"name":"read_file","arguments":{"path":"a.py"}}\n```')
+        self.assertEqual(clean, "")
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+
+    def test_unknown_tool_is_rejected(self):
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+        messages_to_prompt([{"role": "user", "content": "read"}], tools, "auto")
+        with self.assertRaises(ValueError):
+            parse_tool_calls('```tool_call\n{"name":"shell","arguments":{"command":"id"}}\n```')
+
+    def test_required_tool_choice_rejects_text_only(self):
+        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+        messages_to_prompt([{"role": "user", "content": "read"}], tools, "required")
+        with self.assertRaises(ValueError):
+            parse_tool_calls("plain text")
 
 
 if __name__ == "__main__":
