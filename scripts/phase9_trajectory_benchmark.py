@@ -14,10 +14,11 @@ from gemini_web2api.trajectory import run_benchmark
 
 
 def main() -> int:
-    report = run_benchmark(3)
-    payload = report.as_dict()
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    return 0 if report.all_pass and report.pass_at_1 == 1.0 and report.pass_at_3 == 1.0 else 1
+    report = run_benchmark(5)
+    print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+    return 0 if report.all_pass and all(
+        metric == 1.0 for metric in (report.pass_at_1, report.pass_at_3, report.pass_pow_3, report.pass_pow_5)
+    ) else 1
 
 
 if __name__ == "__main__":
