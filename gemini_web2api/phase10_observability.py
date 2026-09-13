@@ -1,8 +1,8 @@
 """Phase 10 observability integration.
 
 This layer instruments the existing Phase 4/5/6 runtime without changing tool
-execution ownership. It emits safe lifecycle events and exposes the current
-trace through the existing ``X-Bridge-Trace-Id`` response header.
+execution ownership. It emits safe lifecycle events and correlates responses
+with the same non-secret ``X-Bridge-Trace-Id`` used by the trace recorder.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import threading
 import time
 from types import ModuleType
 
-from .observability import elapsed_ms, emit_event, event_json, new_trace_id, safe_tool_names
+from .observability import elapsed_ms, emit_event, event_json, new_trace_id, safe_tool_names, TRACE_HEADER
 from .protocol import validate_tool_calls
 from . import phase4_runtime
 
@@ -40,6 +40,7 @@ def install_phase10_observability(handler_cls) -> None:
     module = _module_for(handler_cls)
     original_post = handler_cls.do_POST
     original_get = getattr(handler_cls, "do_GET", None)
+    original_end_headers = getattr(handler_cls, "end_headers", None)
     original_read = getattr(handler_cls, "_read_request_body", None)
     original_chat = getattr(handler_cls, "_handle_chat", None)
     original_responses = getattr(handler_cls, "_handle_responses", None)
@@ -53,6 +54,13 @@ def install_phase10_observability(handler_cls) -> None:
         body = original_read(self, *args, **kwargs) if original_read else b""
         self._phase10_body_bytes = len(body or b"")
         return body
+
+    def end_headers(self, *args, **kwargs):
+        trace_id = getattr(self, "_phase4_trace_id", None) or getattr(self, "_phase10_trace_id", None)
+        if trace_id and not getattr(self, "_phase10_header_sent", False):
+            self.send_header(TRACE_HEADER, trace_id)
+            self._phase10_header_sent = True
+        return original_end_headers(self, *args, **kwargs) if original_end_headers else None
 
     def do_post(self, *args, **kwargs):
         result = original_post(self, *args, **kwargs)
@@ -80,6 +88,7 @@ def install_phase10_observability(handler_cls) -> None:
     def do_get(self, *args, **kwargs):
         result = original_get(self, *args, **kwargs) if original_get else None
         trace_id = getattr(self, "_phase4_trace_id", None) or new_trace_id()
+        self._phase10_trace_id = trace_id
         _state.trace_id = trace_id
         try:
             status = int(getattr(self, "_phase4_status", 200))
@@ -142,7 +151,7 @@ def install_phase10_observability(handler_cls) -> None:
         )
         return original_responses(self, body, *args, **kwargs) if original_responses else None
 
-    def handle_google(body, stream, *args, **kwargs):
+    def handle_google(self, body, stream, *args, **kwargs):
         trace_id = getattr(self, "_phase4_trace_id", None) or new_trace_id()
         _state.trace_id = trace_id
         _log(module, trace_id, "request_received", method="POST", path=getattr(self, "path", "").split("?", 1)[0], body_bytes=len(body or b""))
@@ -168,6 +177,8 @@ def install_phase10_observability(handler_cls) -> None:
             if tool_defs:
                 errors = validate_tool_calls(calls, tool_defs)
                 _log(module, trace_id, "schema_validation", status="pass" if not errors else "fail", error_count=len(errors), tool_names=names)
+            if calls:
+                _log(module, trace_id, "client_tool_call_returned", count=len(calls), tool_names=names)
         return clean, calls
 
     def generate(*args, **kwargs):
@@ -203,6 +214,8 @@ def install_phase10_observability(handler_cls) -> None:
             raise
 
     handler_cls._read_request_body = read_request_body
+    if original_end_headers:
+        handler_cls.end_headers = end_headers
     handler_cls.do_POST = do_post
     if original_get:
         handler_cls.do_GET = do_get
