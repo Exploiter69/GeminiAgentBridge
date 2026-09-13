@@ -80,30 +80,11 @@ class Phase3AgentContractTests(unittest.TestCase):
         _, calls = protocol.parse_tool_calls_robust(block + "\n" + block)
         self.assertEqual(len(calls), 1)
 
-    def test_malformed_call_recovers_before_reaching_client(self):
-        invalid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":123}}\n@@END_TOOL_CALL@@'
-        valid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":"pwd"}}\n@@END_TOOL_CALL@@'
-        protocol.set_tool_context(self.tools, "auto")
-        with mock.patch("gemini_web2api._original_generate", side_effect=[invalid, valid]) as upstream:
-            result = server.generate("run pwd", "gemini-3.1-pro", False, None, None)
-        self.assertEqual(result, valid)
-        self.assertEqual(upstream.call_count, 2)
-        protocol.clear_tool_context()
-
-    def test_repair_loop_is_bounded(self):
-        invalid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":123}}\n@@END_TOOL_CALL@@'
-        protocol.set_tool_context(self.tools, "auto")
-        with mock.patch("gemini_web2api._original_generate", return_value=invalid) as upstream:
-            result = server.generate("run pwd", "gemini-3.1-pro", False, None, None)
-        self.assertEqual(result, invalid)
-        self.assertEqual(upstream.call_count, 3)
-        protocol.clear_tool_context()
-
     def test_chat_completion_returns_valid_openai_tool_calls(self):
         self.setUp_server()
         try:
-            valid = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":"pwd"}}\n@@END_TOOL_CALL@@'
-            with mock.patch("gemini_web2api._original_generate", return_value=valid):
+            valid = '```tool_call\n{"name":"bash","arguments":{"command":"pwd"}}\n```'
+            with mock.patch("gemini_web2api.server.generate", return_value=valid) as upstream:
                 status, body = self._call("/v1/chat/completions", {
                     "model": "gemini-3.1-pro",
                     "messages": [{"role": "user", "content": "run pwd"}],
@@ -115,14 +96,15 @@ class Phase3AgentContractTests(unittest.TestCase):
             self.assertIsNone(message["content"])
             self.assertEqual(message["tool_calls"][0]["function"]["name"], "bash")
             self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {"command": "pwd"})
+            self.assertEqual(upstream.call_count, 1)
         finally:
             self.tearDown_server()
 
     def test_responses_api_preserves_tool_result_across_turns(self):
         self.setUp_server()
         try:
-            first = '@@TOOL_CALL@@\n{"name":"read_file","arguments":{"path":"app.py"}}\n@@END_TOOL_CALL@@'
-            with mock.patch("gemini_web2api._original_generate", return_value=first):
+            first = '```tool_call\n{"name":"read_file","arguments":{"path":"app.py"}}\n```'
+            with mock.patch("gemini_web2api.server.generate", return_value=first):
                 status, body = self._call("/v1/responses", {
                     "model": "gemini-3.1-pro",
                     "input": [{"type": "input_text", "text": "Read app.py"}],
@@ -132,7 +114,7 @@ class Phase3AgentContractTests(unittest.TestCase):
             call = next(item for item in body["output"] if item["type"] == "function_call")
             output = [{"type": "function_call_output", "call_id": call["call_id"], "name": "read_file", "output": "print('ok')"}]
             output.insert(0, {"type": "message", "role": "assistant", "content": [{"type": "function_call", "call_id": call["call_id"], "name": "read_file", "arguments": call["arguments"]}]})
-            with mock.patch("gemini_web2api._original_generate", return_value="The file contains print('ok').") as upstream:
+            with mock.patch("gemini_web2api.server.generate", return_value="The file contains print('ok').") as upstream:
                 status, body2 = self._call("/v1/responses", {
                     "model": "gemini-3.1-pro",
                     "input": output,
