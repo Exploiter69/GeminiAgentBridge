@@ -22,47 +22,66 @@ def _is_tool_related(message: dict[str, Any]) -> bool:
     return _is_tool_message(message) or bool(message.get("tool_calls"))
 
 
+def _message_char_count(message: dict[str, Any]) -> int:
+    return len(_content_text(message)) + len(str(message.get("tool_calls", "")))
+
+
 def compact_messages(messages: list[dict[str, Any]], max_chars: int | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Compact messages while preserving task identity and recent tool state.
 
     The function never invents or summarizes tool results. If a message does
     not fit, it is removed and represented only by an explicit elision marker.
     ``max_chars=None`` or a non-positive budget disables compaction.
+
+    Phase 12 keeps the same selection policy as the original implementation,
+    but tracks the retained character count incrementally instead of repeatedly
+    serializing/sorting the retained set for every candidate.
     """
+    original_chars = _message_chars(messages)
     if not max_chars or max_chars <= 0:
-        return list(messages), {"compacted": False, "elided_messages": 0, "chars": _message_chars(messages)}
-    if _message_chars(messages) <= max_chars:
-        return list(messages), {"compacted": False, "elided_messages": 0, "chars": _message_chars(messages)}
+        return list(messages), {"compacted": False, "elided_messages": 0, "chars": original_chars}
+    if original_chars <= max_chars:
+        return list(messages), {"compacted": False, "elided_messages": 0, "chars": original_chars}
 
     indexed = list(enumerate(messages))
     keep: set[int] = set()
+    keep_chars = 0
+
+    def add(index: int) -> None:
+        nonlocal keep_chars
+        if index not in keep:
+            keep.add(index)
+            keep_chars += _message_char_count(messages[index])
 
     # Contract/system messages are highest priority.
-    keep.update(i for i, m in indexed if m.get("role") == "system")
+    for i, message in indexed:
+        if message.get("role") == "system":
+            add(i)
 
     # Preserve the newest user message as the current task.
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "user":
-            keep.add(i)
+            add(i)
             break
 
     # Preserve the newest tool call/result pairs and their immediate assistant
     # messages. This is deliberately recency-based and does not fabricate a
     # summary when older content is removed.
     recent_related = [i for i, m in indexed if _is_tool_related(m)]
-    keep.update(recent_related[-6:])
-    for i in list(keep):
+    for i in recent_related[-6:]:
+        add(i)
+    for i in tuple(keep):
         if i > 0 and _is_tool_related(messages[i]):
-            keep.add(i - 1)
+            add(i - 1)
 
     # Fill remaining budget from newest messages first, without splitting a
     # message or changing its contents.
     for i in range(len(messages) - 1, -1, -1):
         if i in keep:
             continue
-        candidate = sorted(keep | {i})
-        if _message_chars([messages[j] for j in candidate]) <= max_chars:
-            keep.add(i)
+        candidate_chars = keep_chars + _message_char_count(messages[i])
+        if candidate_chars <= max_chars:
+            add(i)
 
     selected = sorted(keep)
     elided = len(messages) - len(selected)
@@ -84,8 +103,4 @@ def compact_messages(messages: list[dict[str, Any]], max_chars: int | None) -> t
 
 
 def _message_chars(messages: list[dict[str, Any]]) -> int:
-    total = 0
-    for message in messages:
-        total += len(_content_text(message))
-        total += len(str(message.get("tool_calls", "")))
-    return total
+    return sum(_message_char_count(message) for message in messages)

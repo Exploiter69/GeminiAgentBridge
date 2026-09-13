@@ -7,6 +7,8 @@ DEFAULT_CONFIG = {
     "host": "0.0.0.0",
     "retry_attempts": 3,
     "retry_delay_sec": 2,
+    "retry_backoff_multiplier": 2.0,
+    "retry_max_delay_sec": 30.0,
     "request_timeout_sec": 180,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
@@ -17,11 +19,11 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
-    # 0 disables compaction until a measured deployment budget is selected.
     "prompt_soft_budget_chars": 0,
     "tool_schema_budget_chars": 30000,
-    # Exactly one bounded repair round by default; 0 disables automatic repair.
     "tool_repair_attempts": 1,
+    # Phase 7 is an experiment. It must remain disabled unless explicitly enabled.
+    "planner_enabled": False,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
