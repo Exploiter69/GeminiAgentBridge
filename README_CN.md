@@ -4,263 +4,216 @@
   <img src="logo.png" width="200" alt="gemini-web2api logo">
 </p>
 
-[English](README.md)
+[English](README.md) · [完整文档](docs/README.md) · [路线图](roadmap.md)
 
-将 Google Gemini 网页端转换为 OpenAI 兼容 API. 零成本, 跨平台, 单文件.
+> **当前状态：** 正在进行 Gemini Web 上游传输修复。`repair-live-gemini-web` 分支已经加入维护中的 `gemini-webapi` 传输，但在新的真实 Gemini Web 会话完成端到端验证之前，不应视为正式发布版本。
 
-## 特性
+`gemini-web2api` 将 Gemini Web 转换为本地 OpenAI 兼容 API，使 Hermes、OpenCode 等 Agent 可以把 Gemini 作为推理后端，同时继续由 Agent 自己负责文件系统、终端、Git、测试和其他工具执行。
 
-- **可选密钥**: `api_keys` 为空时免密, 填入密钥后按 OpenAI Bearer Key 校验
-- **OpenAI 兼容**: 直接替换 `/v1/chat/completions` 和 `/v1/models`
-- **工具调用**: 完整的 Function Calling 支持 (OpenAI 格式)
-- **多模型**: Flash (3.6), 扩展思考 (2万字+输出), Pro, Auto, Lite
-- **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
-- **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
-- **跨平台**: 纯 Python, 仅一个可选依赖 (`httpx` 用于流式输出)
-- **流式输出**: 基于 `httpx` 的 SSE Streaming 支持
-- **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
-- **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
+## 架构
+
+```text
+Gemini Web
+   │ 推理 / 模型响应
+   ▼
+GeminiAgentBridge
+   │ HTTP 协议 / 上下文 / 工具调用校验 / 恢复 / 可观测性
+   ▼
+Hermes / OpenCode
+   │ 工具执行 / 工作目录状态
+   ▼
+文件系统 / Shell / Git / 测试
+```
+
+**核心边界：Bridge 不执行下游工具。** Bridge 可以解析、规范化、校验和有限修复工具调用，但真正执行工具的是 Hermes/OpenCode。
+
+## 当前主要能力
+
+- OpenAI 兼容 `/v1/chat/completions` 与 `/v1/models`。
+- Responses 兼容层以及 Codex 相关协议测试。
+- Function Calling 解析、Schema 校验、有限修复和恢复。
+- Workspace grounding / 上下文连续性 / observation integrity。
+- 结构化、自动脱敏的生命周期日志。
+- 保守 enum coercion 与有界重试/稳定性逻辑。
+- Hermes/OpenCode 兼容性测试与 trajectory benchmark。
+- 当前修复分支默认使用 `gemini-webapi==2.1.1` 作为 Gemini Web 传输。
+- 原来的 `StreamGenerate` 传输保留为显式 legacy backend，不再作为默认实时路径。
 
 ## 快速开始
 
 ```bash
-pip install httpx
-python gemini_web2api.py
+git clone https://github.com/Exploiter69/GeminiAgentBridge.git
+cd GeminiAgentBridge
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cp config.example.json config.json
+python -m gemini_web2api
 ```
 
-服务启动在 `http://localhost:8081/v1`.
+默认地址：
 
-## 客户端配置
+```text
+http://127.0.0.1:8081/v1
+```
 
-### Cherry Studio / ChatBox / 任何 OpenAI 兼容客户端
+Python 3.11+ 是当前维护中的 Gemini Web 客户端所需版本。
 
-| 字段 | 值 |
-|------|-----|
-| Base URL | `http://localhost:8081/v1` |
-| API Key | `config.json` 中的任意 `api_keys`；未配置时随便填 |
-| Model | `gemini-3.5-flash-thinking` |
+## Gemini Web 登录态
 
-### curl
+现代传输需要可用的 Gemini Web session。仓库内置 `gemini-cookie-sync-extension/`，可以从当前浏览器登录态导出本地 `gemini-auth.json`。
+
+使用：
 
 ```bash
-curl http://localhost:8081/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-key" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"你好!"}]}'
+python -m gemini_web2api \
+  --cookie-file /path/to/gemini-auth.json
 ```
 
-### OpenAI Python SDK
+或者在 `config.json` 中设置：
+
+```json
+{
+  "upstream_backend": "modern",
+  "cookie_file": "/path/to/gemini-auth.json"
+}
+```
+
+**不要**把 cookie、session、API key 粘贴到 issue、聊天、日志或 Git。认证文件应使用严格权限，例如：
+
+```bash
+chmod 600 /path/to/gemini-auth.json
+```
+
+如果上游报告：
+
+```text
+Account status: UNAUTHENTICATED
+Session is not authenticated or cookies have expired
+```
+
+说明 Gemini Web session 已失效/过期；这与 Bridge HTTP 协议层是否正常是两个不同问题。
+
+## OpenAI 客户端
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
-resp = client.chat.completions.create(
-    model="gemini-3.5-flash-thinking",
-    messages=[{"role": "user", "content": "解释量子计算"}]
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8081/v1",
+    api_key="local-key",
 )
-print(resp.choices[0].message.content)
+
+response = client.chat.completions.create(
+    model="gemini-3.6-flash",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(response.choices[0].message.content)
 ```
 
-### Gemini CLI
+Hermes/OpenCode 的详细配置见 [`docs/clients.md`](docs/clients.md)。
+
+## curl
 
 ```bash
-export GEMINI_API_KEY=none
-export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
-gemini
+curl -sS \
+  -H 'Authorization: Bearer YOUR_BRIDGE_KEY' \
+  -H 'Content-Type: application/json' \
+  http://127.0.0.1:8081/v1/chat/completions \
+  -d '{"model":"gemini-3.6-flash","messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":false}'
 ```
 
-支持 Google 原生 API 端点:
-- `GET /v1beta/models` — 模型列表
-- `POST /v1beta/models/{model}:generateContent` — 非流式生成
-- `POST /v1beta/models/{model}:streamGenerateContent` — 流式生成 (SSE)
+## 模型
 
-## 可用模型
+当前 Bridge 暴露的是客户端模型别名。现代传输根据模型 tier 映射到 Gemini Web，而不是依赖旧版固定 deployment ID。
 
-| 模型 | 说明 | 输出量 |
-|------|------|--------|
-| `gemini-3.6-flash` | 全能模型 (最新) | ~1.2万字 |
-| `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
-| `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
-| `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
-| `gemini-3.1-pro` | 高级数学与代码 (需 cookie) | ~1.2万字 |
-| `gemini-auto` | 自动选择模型 | 不定 |
-| `gemini-flash-lite` | 最快响应, 轻量 | ~1万字 |
+常见名称包括：
 
-### 思考深度
+- `gemini-3.7-flash`
+- `gemini-3.6-flash`
+- `gemini-3.5-flash`
+- `gemini-3.5-flash-thinking`
+- `gemini-3.5-flash-thinking-lite`
+- `gemini-3.1-pro`
+- `gemini-3.1-pro-enhanced`
+- `gemini-auto`
+- `gemini-flash-lite`
 
-在模型名后追加 `@think=N`:
+这些名称是 Bridge 的客户端兼容别名，不代表 Google 永久固定的内部 deployment。
 
-```
-gemini-3.5-flash-thinking@think=0   # 最深 (默认)
-gemini-3.5-flash-thinking@think=2   # 中等
-gemini-3.5-flash-thinking@think=4   # 最浅
-```
+## 工具调用
 
-## 可选: Cookie 配置 (Pro 模型)
-
-匿名访问对所有模型有效, 但 `gemini-3.1-pro` 在无认证时会路由到 Flash. 要获得真正的 Pro 路由, 需要 **Gemini Advanced (付费订阅)** 账号的 cookie:
-
-```bash
-python gemini_web2api.py --cookie-file cookie.txt
+```text
+Gemini → 提出工具调用
+Bridge → 解析 / 校验 / 规范化 / 有限修复
+Hermes/OpenCode → 执行工具
+Hermes/OpenCode → 返回 observation
+Bridge → 保留 observation integrity
+Gemini → 决定下一步
 ```
 
-### 如何获取 Cookie
+Bridge 不会执行 Shell、读取任意工作区文件、修改 Git 仓库，也不会伪造工具结果。
 
-1. 打开 Chrome, 访问 [gemini.google.com](https://gemini.google.com) 并登录 **Gemini Advanced** 付费账号
-2. 打开开发者工具 (F12) → Application → Cookies → `https://gemini.google.com`
-3. 复制以下 cookie 值: `SID`, `HSID`, `SSID`, `APISID`, `SAPISID`, `__Secure-1PSID`
-4. 创建 `cookie.txt`, 格式如下:
+## 配置
 
-```
-SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值; SAPISID=你的SAPISID值; __Secure-1PSID=你的1PSID值
-```
+完整配置说明见 [`docs/configuration.md`](docs/configuration.md)。主要字段：
 
-或使用 JSON 格式:
-```json
-{"cookie": "SID=xxx; HSID=xxx; SSID=xxx; APISID=xxx; SAPISID=xxx; __Secure-1PSID=xxx", "sapisid": "你的SAPISID值"}
-```
+| 字段 | 作用 |
+|---|---|
+| `port` | HTTP 端口，默认 8081 |
+| `host` | 监听地址 |
+| `upstream_backend` | 默认 `modern`；`legacy` 仅用于显式兼容 |
+| `cookie_file` | Gemini Web session 文件 |
+| `proxy` | HTTP 代理 |
+| `api_keys` | Bridge 本地 API 密钥 |
+| `temporary_chats` | Gemini Web 临时聊天开关 |
+| `retry_attempts` | 有界重试次数 |
+| `prompt_soft_budget_chars` | prompt 软预算 |
+| `tool_schema_budget_chars` | tool schema 预算 |
+| `planner_enabled` | Phase 7 实验 planner，默认关闭 |
 
-**替代方案 (浏览器扩展)**: 使用任意 "Export Cookies" 扩展导出 `gemini.google.com` 的 cookie, 然后转换为上述单行格式.
+## Docker
 
-### 登录账号路径与 XSRF Token
-
-如果已登录的 Gemini 页面 URL 带账号序号, 例如:
-
-```
-https://gemini.google.com/u/1/app/...
-```
-
-请把 `auth_user` 设置为该序号。登录态的 Gemini Web 请求还可能需要页面里的 XSRF token。该 token 在渲染后的 Gemini 页面源码中名为 `SNlM0e`; 在 `config.json` 中填入 `xsrf_token` 后, 服务会把它作为 `at` 表单字段提交。
-
-示例:
-
-```json
-{
-  "cookie_file": "/app/cookie.txt",
-  "auth_user": "1",
-  "xsrf_token": "AOOh0P...",
-  "gemini_bl": "boq_assistant-bard-web-server_YYYYMMDD.xx_p0"
-}
-```
-
-如果登录态请求返回 HTTP 400 且错误中包含 `xsrf`, 请刷新 Gemini Web 后更新 `xsrf_token`, 并确认 `auth_user` 与浏览器 URL 中的 `/u/<序号>/` 一致.
-
-Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 cookie 可以登录认证, 但会静默回退到 Flash.
-
-## 配置文件
-
-在同目录创建 `config.json`:
-
-```json
-{
-  "port": 8081,
-  "host": "0.0.0.0",
-  "retry_attempts": 3,
-  "retry_delay_sec": 2,
-  "request_timeout_sec": 180,
-  "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
-  "auth_user": null,
-  "xsrf_token": null,
-  "api_keys": ["sk-your-key"],
-  "cookie_file": null,
-  "proxy": null,
-  "log_requests": true,
-  "temporary_chats": false
-}
-```
-
-将 `temporary_chats` 设置为 `true` 后，请求会使用 Gemini 网页版的临时聊天，
-不会将对话保存在账号历史记录中。
-
-`api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
-
-## Docker 部署
+Docker 仍然支持，但 Gemini Web session 和网络行为取决于运行环境。认证文件应作为挂载文件提供，不应写入镜像层。
 
 ```bash
 cp config.example.json config.json
 docker build -t gemini-web2api .
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json gemini-web2api
+docker run --rm \
+  -p 8081:8081 \
+  -v "$PWD/config.json:/app/config.json:ro" \
+  gemini-web2api
 ```
 
-或使用 Docker Compose:
+## 常见问题
 
-```bash
-cp config.example.json config.json
-docker compose up -d
-```
+| 现象 | 优先检查 |
+|---|---|
+| `/v1/models` 正常，但生成提示未认证 | Gemini Web session |
+| `StreamGenerate` + HTTP 405 | 旧 legacy 进程/旧传输 |
+| 当前上游 HTTP 429 | Gemini 上游限流/反滥用/网络环境 |
+| `gemini-webapi is not installed` | Python venv / requirements |
+| `Address already in use` | 其他进程占用了端口 |
+| SSE 已开始后又失败 | 当前 streaming error propagation 限制 |
 
-如需挂载 Cookie 文件:
+完整排错见 [`docs/troubleshooting.md`](docs/troubleshooting.md)。
 
-```bash
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
-```
+## 当前发布状态
 
-此时 `config.json` 中设置 `"cookie_file": "/app/cookie.txt"`.
+Phase 1–13 已完成历史验证，其中 Phase 8 的真实客户端本地证据为 Hermes 13/13、OpenCode 13/13。
 
-> **注意**: 如果 Docker 默认 bridge 网络下出现空回复 (`content: null`), 请切换到 host 网络: `docker run --network host ...` 或在 compose 文件中添加 `network_mode: host`. 这是 Gemini 上游拒绝来自 Docker NAT IP 段的请求导致的.
+但当前分支修改了 Gemini Web 实时传输，因此这些历史结果不能直接证明新的 upstream transport 已经可用。正式发布前必须重新通过：
 
-## 代理配置
+1. 真实认证 Gemini Web 非流式生成；
+2. 真实认证 Gemini Web 流式生成；
+3. Hermes 实测；
+4. OpenCode 实测；
+5. 完整 deterministic release gate。
 
-如果无法直接访问 `gemini.google.com` (连接超时), 需要配置代理:
-
-**方式 1: 命令行参数**
-```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
-```
-
-**方式 2: config.json**
-```json
-{"proxy": "http://127.0.0.1:7890"}
-```
-
-**方式 3: 环境变量** (自动检测)
-```bash
-set HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
-```
-
-支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
-
-## 图片输入
-
-Chat Completions 和 Responses API 支持 OpenAI 风格的多模态消息。图片可以使用
-HTTP(S) URL 或 base64 data URL:
-
-```python
-resp = client.chat.completions.create(
-    model="gemini-3.6-flash",
-    messages=[{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "描述这张图片"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
-        ]
-    }]
-)
-```
-
-## 已知限制
-
-- **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
-- **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
-- **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
-- **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
-
-## 系统要求
-
-- Python 3.8+
-- `httpx` (`pip install httpx`) — 用于流式请求
-- 需要能访问 `gemini.google.com` (部分地区需代理)
-
-## 工作原理
-
-逆向 Google Gemini 网页端的 StreamGenerate 协议, 将 OpenAI API 格式与 Gemini 内部 protobuf-like 格式互转. 模型选择通过请求 payload 的 `[79]` 字段控制, 映射自 Gemini 前端 JS 源码中的 `MODE_CATEGORY` 枚举.
-
-## 致谢
-
-- [linux.do](https://linux.do) 社区
-- 开源 API 代理生态
+详见 [`docs/release-status.md`](docs/release-status.md)。
 
 ## License
 
-MIT
+MIT。
