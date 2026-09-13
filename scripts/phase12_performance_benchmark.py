@@ -7,7 +7,13 @@ observations, not hard pass/fail thresholds; correctness invariants are gates.
 from __future__ import annotations
 
 import json
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+# Allow direct execution as ``python scripts/phase12_performance_benchmark.py``
+# from a clean checkout, matching the CI invocation.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gemini_web2api.context import compact_messages
 from gemini_web2api.performance import RetryPolicy, benchmark_callable, stable_report
@@ -77,7 +83,6 @@ def main() -> int:
         iterations=30,
     )
 
-    # Concurrent requests exercise only deterministic local work.
     def concurrent_compaction() -> list[dict]:
         with ThreadPoolExecutor(max_workers=8) as executor:
             return list(executor.map(lambda _: compact_messages(messages, 5000)[1], range(16)))
