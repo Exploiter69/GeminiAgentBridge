@@ -1,4 +1,9 @@
-"""Gemini StreamGenerate protocol implementation with httpx streaming."""
+"""Gemini Web transport implementations.
+
+The legacy StreamGenerate implementation remains available for explicit
+compatibility, while the maintained gemini-webapi transport is the default for
+live Gemini Web traffic.
+"""
 import json
 import time
 import uuid
@@ -19,6 +24,7 @@ except ImportError:
 
 from .config import CONFIG
 from .performance import RetryPolicy
+from .modern import ModernBackendUnavailable, generate as modern_generate, generate_stream as modern_generate_stream
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
@@ -257,7 +263,16 @@ def _sleep_before_retry(policy: RetryPolicy, attempt: int, error: Exception) -> 
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with bounded, selective retry."""
+    """Generate using the configured live transport, or the legacy transport explicitly."""
+    backend = str(CONFIG.get("upstream_backend", "modern")).lower()
+    if backend != "legacy":
+        try:
+            return modern_generate(prompt, model_id)
+        except ModernBackendUnavailable:
+            if backend == "modern":
+                raise
+            log("Modern Gemini transport unavailable; falling back to legacy transport")
+
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
@@ -291,7 +306,17 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Streaming generation via httpx with bounded retry and stale-client recovery."""
+    """Stream using the configured live transport, or the legacy transport explicitly."""
+    backend = str(CONFIG.get("upstream_backend", "modern")).lower()
+    if backend != "legacy":
+        try:
+            yield from modern_generate_stream(prompt, model_id)
+            return
+        except ModernBackendUnavailable:
+            if backend == "modern":
+                raise
+            log("Modern Gemini transport unavailable; falling back to legacy transport")
+
     if not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
