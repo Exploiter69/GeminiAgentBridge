@@ -76,7 +76,8 @@ def install_phase4_runtime(handler_cls) -> None:
 
     def log_message(self, fmt, *args):
         if original_log_message:
-            return original_log_message(self, fmt, tuple(_safe_path(a) for a in args))
+            safe_args = tuple(_safe_path(a) for a in args)
+            return original_log_message(self, fmt, *safe_args)
 
     def do_post(self, *args, **kwargs):
         self._phase4_trace_id = new_trace_id()
@@ -96,7 +97,7 @@ def install_phase4_runtime(handler_cls) -> None:
         self._phase4_status = 500
         try:
             result = original_get(self, *args, **kwargs) if original_get else None
-            module.log(str(response_summary(self._phase4_trace_id, getattr(self, "_phase4_status", 200), elapsed_ms(self._phase4_started))) )
+            module.log(str(response_summary(self._phase4_trace_id, getattr(self, "_phase4_status", 200), elapsed_ms(self._phase4_started))))
             return result
         finally:
             _clear_request()
