@@ -1,19 +1,39 @@
-Gemini Cookie Sync v1.0
+Gemini Cookie Sync
 
 Purpose:
-- Read cookies for the current Google/Gemini session.
-- Extract the XSRF token named SNlM0e from the Gemini page.
-- Extract gemini_bl from cfb2h or from page requests when available.
+- Read the currently signed-in Gemini browser session.
+- Collect the session/auth metadata required by the bridge's authenticated Gemini Web path.
 - Export `gemini-auth.json` locally only.
 
+This extension is an operator convenience tool, not a remote authentication service. The generated file is a live Google/Gemini session credential.
+
 Installation:
-1. Open `chrome://extensions`
-2. Enable Developer mode
-3. Click Load unpacked
-4. Select this folder
-5. Open `https://gemini.google.com/app`, sign in, and refresh the page
-6. Click Inspect session
-7. Click Export `gemini-auth.json`
+1. Open `chrome://extensions`.
+2. Enable Developer mode.
+3. Click **Load unpacked**.
+4. Select this directory.
+5. Open `https://gemini.google.com/app` in the same browser profile.
+6. Sign in and refresh the page.
+7. Open the extension and choose **Inspect session**.
+8. Confirm the session is ready.
+9. Choose **Export gemini-auth.json**.
+
+Use with the bridge:
+
+```bash
+python -m gemini_web2api --cookie-file /path/to/gemini-auth.json
+```
+
+or configure `cookie_file` in `config.json`.
 
 Security:
-The generated file represents the real Google session and must be treated as secret. Do not send it, print it, or commit it to Git.
+The generated file represents a real Google session. Treat it like a password/session token.
+
+- Do not send it to anyone.
+- Do not print its contents.
+- Do not paste it into ChatGPT, GitHub issues, logs, or terminals that are being recorded.
+- Do not commit it to Git.
+- Use restrictive permissions such as `chmod 600`.
+- Re-export/rotate the session if it is exposed.
+
+The extension does not make the bridge immune to Gemini Web session expiry, account restrictions, throttling, or upstream protocol changes.
