@@ -1,6 +1,6 @@
 # Phase 8 Real-Client Evidence
 
-This is a durable record of the independent local Hermes/OpenCode gate executed before Phase 13.
+This document records the independent local Hermes/OpenCode compatibility gate executed before the current live Gemini Web transport repair.
 
 ## Command
 
@@ -16,6 +16,10 @@ python scripts/phase8_client_compat.py --hermes --opencode
 - Required matrix: 13/13 roadmap cases
 - Bridge execution boundary remained intact; downstream filesystem/terminal execution stayed with the agent clients.
 
-The execution was performed as a local real-client gate because GitHub-hosted CI does not provide the user's installed Hermes/OpenCode environments. The harness itself is committed at `scripts/phase8_client_compat.py` and creates isolated temporary workspaces for each case.
+The harness creates isolated temporary workspaces and does not require hosted CI to provide the user's installed agent clients.
 
-This document is evidence of that prior independent run, not a claim that the hosted CI runner executed Hermes/OpenCode.
+## Evidence boundary
+
+This is **historical real-client evidence** for the transport/client contract that existed before the current Gemini Web upstream repair. It is not a claim that GitHub-hosted CI executed Hermes/OpenCode, and it is not a claim that the current unreleased `repair-live-gemini-web` transport has passed a fresh live Gemini Web generation test.
+
+A changed upstream transport requires a new live gate before the historical 26/26 result can be cited as release evidence for that transport.

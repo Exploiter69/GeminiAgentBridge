@@ -1,26 +1,40 @@
 # Phase 13 Release Candidate Status
 
-This document is the durable release-status record for the Phase 13 gate.
+Phase 13 is the durable record of the independent repository-level release gate performed before the current live Gemini Web transport repair.
 
-## Scope
+## What Phase 13 proved
 
-Phases 1–12 are complete and independently verified through their phase regressions and CI history. Phase 13 adds an independent repository-level release verifier rather than relying on agent-reported success.
+- repository/git integrity checks passed;
+- historical phase commits were checked as ancestors of the candidate;
+- compile, credential-pattern, full-suite, trajectory, and performance gates were executed independently;
+- the durable Hermes/OpenCode real-client evidence existed and contained the required 13/13 + 13/13 result;
+- machine-readable release evidence and a SHA-256 manifest were emitted under `artifacts/`;
+- the verifier recorded `agent_claims_used_as_verification: false`.
 
-## Honesty / auditability gate
+## Historical result
 
-- Reproducible regression commands are executed by `scripts/phase13_release_candidate.py`.
-- Required files are checked from the repository filesystem.
-- Historical phase commits are resolved with Git and checked as ancestors of the release candidate.
-- Phase 13 changed paths are verified against the Phase 12 baseline.
-- Compile, credential-pattern, full-suite, trajectory, and performance gates are executed independently.
-- Real Hermes/OpenCode evidence is preserved separately in `docs/phase8-real-client-evidence.md` because hosted CI does not provide those installed clients.
-- The verifier records `agent_claims_used_as_verification: false`.
-- Machine-readable evidence and a SHA-256 manifest are emitted under `artifacts/` by the release gate.
+Phase 13 produced a `GO` for the codebase that existed at that point and was merged at:
 
-## Release rule
+```text
+a6e9e72bfe09a35974a456779ac8afeaad775477
+```
 
-`GO` requires every deterministic check to pass and the durable Hermes/OpenCode evidence to exist and contain the required 13/13 + 13/13 result. No agent response is accepted as proof.
+## Important status correction
 
-## Roadmap execution-state correction
+The subsequent live-client investigation found that the old default execution path could still reach the historical direct `StreamGenerate` implementation and produce HTTP 405/429 behavior. The current repair branch therefore changes the live upstream transport.
 
-The older Phase 4–12 execution queue in `roadmap.md` is historical/stale relative to the merged repository state. Phase 13 is the active release gate; this status document is the explicit durable release-state record until the roadmap's queue is rewritten in a future documentation-only update.
+That means the Phase 13 `GO` is **historical evidence**, not a release certificate for the changed transport.
+
+## Current release gate
+
+The current transport repair must establish all of the following again:
+
+- maintained modern Gemini Web transport is the actual live path;
+- a fresh authenticated Gemini Web session can generate non-streaming output;
+- the same session can generate streaming output;
+- Hermes can use the resulting server for real agent work;
+- OpenCode can use the resulting server where installed;
+- streaming failures are not misreported as successful completions;
+- deterministic regression and credential-safety gates remain green.
+
+Until those conditions are met, the repair branch remains unreleased.

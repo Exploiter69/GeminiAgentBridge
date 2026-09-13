@@ -1,5 +1,5 @@
-"""gemini-web2api: Gemini Web to OpenAI API proxy."""
-__version__ = "1.1.0"
+"""GeminiAgentBridge: Gemini Web reasoning bridge with an OpenAI-compatible API."""
+__version__ = "2.0.0"
 
 from . import tools as _tools
 from . import gemini as _gemini
