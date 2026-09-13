@@ -49,7 +49,12 @@ def install_phase4_runtime(handler_cls) -> None:
     original_log_message = getattr(handler_cls, "log_message", None)
     original_chat = getattr(handler_cls, "_handle_chat", None)
     original_responses = getattr(handler_cls, "_handle_responses", None)
-    original_generate = getattr(module, "gemini_stream_generate", None)
+
+    # The modular server imports these functions by name; the legacy entrypoint
+    # instead exposes gemini_stream_generate.  Capture whichever topology exists.
+    original_generate = getattr(module, "generate", None)
+    original_generate_stream = getattr(module, "generate_stream", None)
+    original_legacy_generate = getattr(module, "gemini_stream_generate", None)
 
     def send_json(self, data, status=200):
         trace_id = getattr(self, "_phase4_trace_id", None)
@@ -128,6 +133,18 @@ def install_phase4_runtime(handler_cls) -> None:
             max_chars=int(CONFIG.get("prompt_soft_budget_chars", 0) or 0),
         )
 
+    def recover_error(exc: BaseException) -> RuntimeError:
+        failure = classify_exception(exc)
+        module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
+        return RuntimeError(f"upstream {failure.error_type.value}: {failure.message}")
+
+    def recover_raw(raw):
+        failure = classify_upstream_text(raw)
+        if failure is None:
+            return raw
+        module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
+        raise RuntimeError(f"upstream {failure.error_type.value}: {failure.message}") from None
+
     handler_cls.send_json = send_json
     if hasattr(handler_cls, "_start_sse"):
         handler_cls._start_sse = start_sse
@@ -148,21 +165,33 @@ def install_phase4_runtime(handler_cls) -> None:
             try:
                 raw = original_generate(*args, **kwargs)
             except Exception as exc:
-                failure = classify_exception(exc)
-                module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
-                raise RuntimeError(f"upstream {failure.error_type.value}: {failure.message}") from None
+                raise recover_error(exc) from None
+            return recover_raw(raw)
 
-            failure = classify_upstream_text(raw)
-            if failure is not None:
-                if failure.error_type.value == "empty_response":
-                    module.log("Phase5 upstream failure type=empty_response after bounded upstream retries")
-                    raise RuntimeError("upstream empty_response: Gemini returned no usable response")
-                module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
-                raise RuntimeError(f"upstream {failure.error_type.value}: {failure.message}")
-            return raw
-
-        module.gemini_stream_generate = generate_with_recovery
+        module.generate = generate_with_recovery
         module._phase5_generate_wrapped = True
+
+    if original_generate_stream and not getattr(module, "_phase5_stream_wrapped", False):
+        def generate_stream_with_recovery(*args, **kwargs):
+            try:
+                for delta in original_generate_stream(*args, **kwargs):
+                    yield delta
+            except Exception as exc:
+                raise recover_error(exc) from None
+
+        module.generate_stream = generate_stream_with_recovery
+        module._phase5_stream_wrapped = True
+
+    if original_legacy_generate and not getattr(module, "_phase5_legacy_generate_wrapped", False):
+        def legacy_generate_with_recovery(*args, **kwargs):
+            try:
+                raw = original_legacy_generate(*args, **kwargs)
+            except Exception as exc:
+                raise recover_error(exc) from None
+            return recover_raw(raw)
+
+        module.gemini_stream_generate = legacy_generate_with_recovery
+        module._phase5_legacy_generate_wrapped = True
 
     handler_cls._phase4_installed = True
     module.log(str(request_summary("RUNTIME", "phase4", "phase4+phase5 installed", 0)))
