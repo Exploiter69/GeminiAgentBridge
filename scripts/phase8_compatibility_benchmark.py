@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Deterministic Phase 8 compatibility benchmark.
-
-This benchmark verifies the complete required client matrix is represented and
-that the bridge's OpenAI-compatible response contract accepts representative
-text and tool-call responses. Real Hermes/OpenCode execution is handled by
-scripts/phase8_client_compat.py and is intentionally kept out of CI unless a
-runner has those clients installed.
-"""
+"""Deterministic Phase 8 compatibility benchmark."""
 import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from gemini_web2api.client_compat import (
     COMPATIBILITY_MATRIX,
