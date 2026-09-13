@@ -38,3 +38,22 @@ def _messages_to_prompt_with_protocol(
 
 
 def _generate_with_repair(prompt, model_id, think_mode=False, file_refs=None, extra_fields=None):
+    text = _original_generate(prompt, model_id, think_mode, file_refs, extra_fields)
+    tool_defs, tool_choice = get_tool_context()
+    if not tool_defs or tool_choice == "none":
+        return text
+
+    for _ in range(2):
+        clean, calls = parse_tool_calls_robust(text or "")
+        errors = validate_tool_calls(calls, tool_defs)
+        if not response_needs_repair(text or "", calls, tool_defs, tool_choice):
+            return text
+        repaired_prompt = build_repair_prompt(prompt, errors)
+        text = _original_generate(repaired_prompt, model_id, think_mode, file_refs, extra_fields)
+    return text
+
+
+# Keep the existing public API stable while upgrading the parser and prompt.
+_tools.messages_to_prompt = _messages_to_prompt_with_protocol
+_tools.parse_tool_calls = parse_tool_calls_robust
+_gemini.generate = _generate_with_repair
