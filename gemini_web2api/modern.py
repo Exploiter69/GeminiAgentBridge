@@ -77,8 +77,11 @@ class _ModernBackend:
         try:
             with open(cookie_file, "r", encoding="utf-8") as handle:
                 raw = handle.read().strip()
+            direct_psid = direct_psidts = ""
             if raw.startswith("{"):
                 data = json.loads(raw)
+                direct_psid = str(data.get("__Secure-1PSID", ""))
+                direct_psidts = str(data.get("__Secure-1PSIDTS", ""))
                 cookie_str = str(data.get("cookie", ""))
             else:
                 cookie_str = raw
@@ -88,7 +91,10 @@ class _ModernBackend:
                 if "=" in item:
                     key, value = item.split("=", 1)
                     pairs[key.strip()] = value.strip()
-            return pairs.get("__Secure-1PSID", ""), pairs.get("__Secure-1PSIDTS", "")
+            return (
+                direct_psid or pairs.get("__Secure-1PSID", ""),
+                direct_psidts or pairs.get("__Secure-1PSIDTS", ""),
+            )
         except Exception as exc:
             raise RuntimeError("unable to read Gemini cookie file") from exc
 
