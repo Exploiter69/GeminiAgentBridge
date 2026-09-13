@@ -1,4 +1,6 @@
 import socket
+import sys
+import types
 import unittest
 import urllib.error
 
@@ -14,6 +16,7 @@ from gemini_web2api.recovery import (
     retry_delay,
     run_with_recovery,
 )
+from gemini_web2api.phase4_runtime import install_phase4_runtime
 
 
 class ClassificationTests(unittest.TestCase):
@@ -117,6 +120,46 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(retry_delay(10, 2, cap=30), 20)
         self.assertEqual(retry_delay(10, 3, cap=30), 30)
         self.assertEqual(retry_delay(10, 1, retry_after=60, cap=30), 30)
+
+
+class RuntimeIntegrationTests(unittest.TestCase):
+    def _install_with(self, generate):
+        module_name = "_phase5_fake_server"
+        module = types.ModuleType(module_name)
+        module.generate = generate
+        module.log = lambda _msg: None
+        sys.modules[module_name] = module
+
+        class DummyHandler:
+            __module__ = module_name
+
+            def do_POST(self):
+                return None
+
+        install_phase4_runtime(DummyHandler)
+        return module, DummyHandler
+
+    def tearDown(self):
+        sys.modules.pop("_phase5_fake_server", None)
+
+    def test_runtime_wraps_actual_modular_generate(self):
+        module, _ = self._install_with(lambda *_a, **_k: "")
+        with self.assertRaisesRegex(RuntimeError, "upstream empty_response"):
+            module.generate("prompt")
+
+    def test_runtime_sanitizes_timeout_error(self):
+        def fail(*_a, **_k):
+            raise TimeoutError("secret-cookie-value")
+
+        module, _ = self._install_with(fail)
+        with self.assertRaisesRegex(RuntimeError, "upstream timeout") as ctx:
+            module.generate("prompt")
+        self.assertNotIn("secret-cookie-value", str(ctx.exception))
+
+    def test_runtime_classifies_bard_rate_limit(self):
+        module, _ = self._install_with(lambda *_a, **_k: "BardErrorInfo [429]")
+        with self.assertRaisesRegex(RuntimeError, "upstream rate_limit"):
+            module.generate("prompt")
 
 
 class ToolObservationTests(unittest.TestCase):
