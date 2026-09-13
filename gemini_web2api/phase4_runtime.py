@@ -167,7 +167,8 @@ def install_phase4_runtime(handler_cls) -> None:
             error_lines = errors if errors else ["tool call was required but was not produced"]
             repair_prompt = build_repair_prompt(prompt, error_lines)
             module.log(f"Phase5 tool repair attempt {attempt + 1}/{attempts} type={(failure.error_type.value if failure else 'unknown')}")
-            repaired_raw = recover_raw(generate_once(repair_prompt))
+            repaired_raw = generate_once(repair_prompt)
+            repaired_raw = recover_raw(repaired_raw)
             _, repaired_calls = parse_tool_calls_robust(repaired_raw)
             repaired_errors = validate_tool_calls(repaired_calls, tool_defs)
             if not response_needs_repair(repaired_raw, repaired_calls, tool_defs, tool_choice):
@@ -199,10 +200,14 @@ def install_phase4_runtime(handler_cls) -> None:
     if original_generate and not getattr(module, "_phase5_generate_wrapped", False):
         def generate_with_recovery(*args, **kwargs):
             try:
-                raw = original_generate(*args, **kwargs)
-                raw = recover_raw(raw)
+                raw = recover_raw(original_generate(*args, **kwargs))
                 if args and isinstance(args[0], str):
-                    raw = repair_tool_response(args[0], raw, lambda p: original_generate(p, *args[1:], **kwargs))
+                    def repair_generate(prompt):
+                        try:
+                            return original_generate(prompt, *args[1:], **kwargs)
+                        except Exception as exc:
+                            raise recover_error(exc) from None
+                    raw = repair_tool_response(args[0], raw, repair_generate)
                 return raw
             except RuntimeError:
                 raise
@@ -226,10 +231,14 @@ def install_phase4_runtime(handler_cls) -> None:
     if original_legacy_generate and not getattr(module, "_phase5_legacy_generate_wrapped", False):
         def legacy_generate_with_recovery(*args, **kwargs):
             try:
-                raw = original_legacy_generate(*args, **kwargs)
-                raw = recover_raw(raw)
+                raw = recover_raw(original_legacy_generate(*args, **kwargs))
                 if args and isinstance(args[0], str):
-                    raw = repair_tool_response(args[0], raw, lambda p: original_legacy_generate(p, *args[1:], **kwargs))
+                    def repair_generate(prompt):
+                        try:
+                            return original_legacy_generate(prompt, *args[1:], **kwargs)
+                        except Exception as exc:
+                            raise recover_error(exc) from None
+                    raw = repair_tool_response(args[0], raw, repair_generate)
                 return raw
             except RuntimeError:
                 raise
