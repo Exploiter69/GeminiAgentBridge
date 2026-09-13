@@ -61,8 +61,16 @@ class _ModernBackend:
 
     def _run(self, coro, timeout=None):
         self._ensure_loop()
+        loop = self._loop
+        if loop is None or loop.is_closed() or not self._thread or not self._thread.is_alive():
+            coro.close()
+            raise RuntimeError("modern Gemini transport event loop is unavailable")
         timeout = timeout or max(30, int(CONFIG.get("request_timeout_sec", 180)) + 15)
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:
+            coro.close()
+            raise
         try:
             return future.result(timeout=timeout)
         except Exception:
@@ -221,26 +229,24 @@ class _ModernBackend:
             yield item
 
     def shutdown(self) -> None:
-        loop = self._loop
-        thread = self._thread
-        if not loop or not thread:
-            return
-        if loop.is_closed() or not thread.is_alive():
+        with self._lock:
+            loop = self._loop
+            thread = self._thread
+            self._client = None
+            if not loop or not thread:
+                return
+            if loop.is_closed() or not thread.is_alive():
+                self._loop = None
+                self._thread = None
+                return
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+            if thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=5)
             self._loop = None
             self._thread = None
-            self._client = None
-            return
-        try:
-            self._run(self._close_client(), timeout=10)
-        except Exception:
-            pass
-        if not loop.is_closed():
-            loop.call_soon_threadsafe(loop.stop)
-        if thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=5)
-        self._loop = None
-        self._thread = None
-        self._client = None
 
 
 _BACKEND = _ModernBackend()
