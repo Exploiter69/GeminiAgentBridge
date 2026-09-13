@@ -1,28 +1,20 @@
 """Deterministic trajectory-reliability primitives for Phase 9.
 
-This module is intentionally execution-free.  It evaluates the evidence that
-an agent trajectory would leave at the protocol boundary; Hermes/OpenCode still
-owns real filesystem, shell, Git, and test execution.
+This module is intentionally execution-free. It evaluates evidence at the
+protocol boundary; Hermes/OpenCode still owns real tool execution.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+import json
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from .client_compat import COMPATIBILITY_MATRIX, validate_chat_completion, validate_models_response
 from .protocol import parse_tool_calls_robust, validate_tool_calls, validate_tool_choice
 
 DIMENSIONS = (
-    "protocol",
-    "schema",
-    "selection",
-    "grounding",
-    "observation",
-    "continuity",
-    "recovery",
-    "context",
-    "horizon",
-    "client",
+    "protocol", "schema", "selection", "grounding", "observation",
+    "continuity", "recovery", "context", "horizon", "client",
 )
 
 FAILURE_TAXONOMY = {
@@ -111,14 +103,15 @@ def _fail(dimension: str, evidence: str) -> DimensionResult:
 def _case_protocol() -> CaseResult:
     text = '@@TOOL_CALL@@ {"name":"read_file","arguments":{"path":"sample.txt"}} @@END_TOOL_CALL@@'
     clean, calls = parse_tool_calls_robust(text)
-    passed = bool(calls) and clean == ""
-    result = _ok("strict sentinel parsed and removed") if passed else _fail("protocol", "sentinel parsing did not produce exactly one call")
+    result = _ok("strict sentinel parsed and removed") if len(calls) == 1 and clean == "" else _fail("protocol", "sentinel parsing did not produce exactly one call")
     return CaseResult("protocol", {"protocol": result})
 
 
 def _case_schema() -> CaseResult:
     tools = [{"type": "function", "function": {"name": "read_file", "parameters": {
-        "type": "object", "required": ["path"], "properties": {"path": {"type": "string", "minLength": 1}}, "additionalProperties": False,
+        "type": "object", "required": ["path"],
+        "properties": {"path": {"type": "string", "minLength": 1}},
+        "additionalProperties": False,
     }}}]
     _, calls = parse_tool_calls_robust('@@TOOL_CALL@@ {"name":"read_file","arguments":{"path":"sample.txt"}} @@END_TOOL_CALL@@')
     errors = validate_tool_calls(calls, tools)
@@ -137,8 +130,7 @@ def _case_grounding() -> CaseResult:
     requested_cwd = "/workspace/project"
     requested_path = "sample.txt"
     resolved = f"{requested_cwd}/{requested_path}"
-    model_path = "sample.txt"
-    passed = model_path == requested_path and resolved.startswith(requested_cwd + "/")
+    passed = requested_path == "sample.txt" and resolved.startswith(requested_cwd + "/")
     result = _ok("relative path remains anchored to requested workspace") if passed else _fail("grounding", "relative path escaped requested workspace")
     return CaseResult("grounding", {"grounding": result})
 
@@ -152,8 +144,7 @@ def _case_observation() -> CaseResult:
 
 def _case_continuity() -> CaseResult:
     state = {"last_tool_call": {"name": "read_file", "path": "sample.txt"}, "last_tool_result": "alpha\nbeta\ngamma"}
-    next_prompt_facts = (state["last_tool_call"]["path"], state["last_tool_result"])
-    passed = next_prompt_facts == ("sample.txt", "alpha\nbeta\ngamma")
+    passed = (state["last_tool_call"]["path"], state["last_tool_result"]) == ("sample.txt", "alpha\nbeta\ngamma")
     result = _ok("latest tool call/result pair survives into next action") if passed else _fail("continuity", "latest tool state was lost")
     return CaseResult("continuity", {"continuity": result})
 
@@ -189,15 +180,20 @@ def _case_context() -> CaseResult:
 
 def _case_horizon() -> CaseResult:
     steps = ["list_files", "read_file", "edit_file", "test"]
-    expected = ["list_files", "read_file", "edit_file", "test"]
-    passed = steps == expected and len(steps) == 4
+    passed = steps == ["list_files", "read_file", "edit_file", "test"]
     result = _ok("four-step trajectory preserves ordered intent") if passed else _fail("horizon", "multi-step ordering changed")
     return CaseResult("horizon", {"horizon": result})
 
 
 def _case_client() -> CaseResult:
     text = {"object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}
-    tool = {"object": "chat.completion", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\\"path\\":\\"sample.txt\\"}"}}]}, "finish_reason": "tool_calls"}]}
+    tool_arguments = json.dumps({"path": "sample.txt"}, separators=(",", ":"))
+    tool = {"object": "chat.completion", "choices": [{
+        "message": {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": tool_arguments}
+        }]},
+        "finish_reason": "tool_calls",
+    }]}
     models = {"object": "list", "data": [{"id": "gemini-3.6-flash"}]}
     errors = validate_chat_completion(text) + validate_chat_completion(tool) + validate_models_response(models)
     passed = not errors and len(COMPATIBILITY_MATRIX) == 13
@@ -212,11 +208,8 @@ CASE_BUILDERS: tuple[Callable[[], CaseResult], ...] = (
 
 
 def run_benchmark(attempts: int = 3) -> BenchmarkReport:
-    if attempts < 1:
-        raise ValueError("attempts must be >= 1")
     if attempts < 3:
         raise ValueError("Phase 9 requires at least three attempts for Pass@3")
-
     runs = [[builder() for builder in CASE_BUILDERS] for _ in range(attempts)]
     baseline = tuple(runs[0])
     pass_at_1 = sum(case.passed for case in baseline) / len(baseline)
@@ -232,5 +225,4 @@ def run_benchmark(attempts: int = 3) -> BenchmarkReport:
             item = case.dimensions.get(dimension)
             if item is not None and not item.passed:
                 failure_counts[dimension] += 1
-
     return BenchmarkReport(attempts, baseline, pass_at_1, pass_at_3, dimension_pass_rates, failure_counts)
