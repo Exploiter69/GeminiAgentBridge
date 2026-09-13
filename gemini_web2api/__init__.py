@@ -17,8 +17,20 @@ _original_messages_to_prompt = _tools.messages_to_prompt
 _original_generate = _gemini.generate
 
 
-def _messages_to_prompt_with_protocol(messages, tools=None, tool_choice=None):
-    prompt, images = _original_messages_to_prompt(messages, tools, tool_choice)
+def _messages_to_prompt_with_protocol(
+    messages,
+    tools=None,
+    tool_choice=None,
+    grounding=None,
+    max_chars=None,
+):
+    prompt, images = _original_messages_to_prompt(
+        messages,
+        tools,
+        tool_choice,
+        grounding=grounding,
+        max_chars=max_chars,
+    )
     set_tool_context(tools or [], tool_choice or "auto")
     if tools and tool_choice != "none":
         prompt = f"{prompt}\n\n{STRICT_TOOL_PROTOCOL}"
