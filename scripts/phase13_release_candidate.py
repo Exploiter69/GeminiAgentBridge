@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -74,8 +73,9 @@ def main() -> int:
     add("repository_root", (ROOT / ".git").exists(), str(ROOT))
     head = git("rev-parse", "HEAD")
     branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    branch_ok = branch not in {"", "HEAD"} or os.environ.get("GITHUB_ACTIONS") == "true"
     add("git_head_resolves", len(head) == 40, head)
-    add("git_branch", branch not in {"HEAD", ""}, branch)
+    add("git_branch", branch_ok, branch if branch != "HEAD" else "detached CI merge checkout")
     status = git("status", "--porcelain")
     add("working_tree_clean", status == "", status or "clean")
 
