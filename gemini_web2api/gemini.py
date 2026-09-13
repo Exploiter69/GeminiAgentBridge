@@ -55,8 +55,6 @@ def _get_httpx_client():
 def _reset_httpx_client() -> None:
     """Drop a stale transport so the next request creates a fresh client."""
     global _httpx_client
-    if not HAS_HTTPX:
-        return
     with _httpx_client_lock:
         client, _httpx_client = _httpx_client, None
         if client is not None:
