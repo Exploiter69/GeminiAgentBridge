@@ -30,7 +30,10 @@ def main():
         CONFIG["proxy"] = args.proxy
 
     from .phase4_runtime import install_phase4_runtime
+    from .phase10_observability import install_phase10_observability
+
     install_phase4_runtime(GeminiHandler)
+    install_phase10_observability(GeminiHandler)
 
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
@@ -42,6 +45,7 @@ def main():
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
+    print("  Observability: structured, credential-redacted lifecycle events")
     print()
     try:
         server.serve_forever()
