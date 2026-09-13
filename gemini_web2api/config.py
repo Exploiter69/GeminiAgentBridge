@@ -17,11 +17,11 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
-    # 0 disables compaction until a measured deployment budget is selected.
     "prompt_soft_budget_chars": 0,
     "tool_schema_budget_chars": 30000,
-    # Exactly one bounded repair round by default; 0 disables automatic repair.
     "tool_repair_attempts": 1,
+    # Phase 7 is an experiment. It must remain disabled unless explicitly enabled.
+    "planner_enabled": False,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
