@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Gemini Cookie Sync",
-  "version": "1.0",
-  "description": "Exports Gemini cookies plus XSRF/build metadata for gemini-web2api.",
+  "name": "GeminiAgentBridge Session Sync",
+  "version": "2.0.0",
+  "description": "Locally exports the current Gemini Web session for GeminiAgentBridge.",
   "permissions": [
     "cookies",
     "downloads",
@@ -14,7 +14,7 @@
     "https://*.google.com/*"
   ],
   "action": {
-    "default_title": "Gemini Cookie Sync",
+    "default_title": "GeminiAgentBridge Session Sync",
     "default_popup": "popup.html"
   }
 }
