@@ -18,6 +18,9 @@ from .models import resolve_model
 class HardenedGeminiHandler(GeminiHandler):
     """OpenAI/Google handler with explicit security and streaming invariants."""
 
+    def _is_api_path(self) -> bool:
+        return self.path.startswith("/v1") or self.path.startswith("/v1beta")
+
     def _authorized(self):
         keys = [str(k) for k in (CONFIG.get("api_keys") or []) if str(k)]
         if not keys:
@@ -109,42 +112,18 @@ class HardenedGeminiHandler(GeminiHandler):
                 raise RuntimeError("empty upstream stream")
             self._start_sse()
             committed = True
-            role_chunk = {
-                "id": cid,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model_name,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
+            role_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
             self.wfile.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
-            first_chunk = {
-                "id": cid,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model_name,
-                "choices": [{"index": 0, "delta": {"content": first}, "finish_reason": None}],
-            }
+            first_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name, "choices": [{"index": 0, "delta": {"content": first}, "finish_reason": None}]}
             self.wfile.write(f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n".encode())
             self.wfile.flush()
             for delta in stream:
                 if not delta:
                     continue
-                chunk = {
-                    "id": cid,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_name,
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                }
+                chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
-            end = {
-                "id": cid,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
+            end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -174,10 +153,7 @@ class HardenedGeminiHandler(GeminiHandler):
             for delta in itertools.chain((first,), stream):
                 if not delta:
                     continue
-                chunk_obj = {
-                    "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
-                    "modelVersion": model_name,
-                }
+                chunk_obj = {"candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}], "modelVersion": model_name}
                 self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
             final = {"candidates": [{"finishReason": "STOP", "index": 0}], "modelVersion": model_name}
@@ -243,9 +219,15 @@ class HardenedGeminiHandler(GeminiHandler):
                     return
         return super()._handle_google_generate(body, stream)
 
+    def do_GET(self):
+        if self._is_api_path() and not self._authorized():
+            self.send_json({"error": {"message": public_error(401)}}, 401)
+            return
+        return super().do_GET()
+
     def do_POST(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            if self._is_api_path() and not self._authorized():
                 self.send_json({"error": {"message": public_error(401)}}, 401)
                 return
             body = self._read_request_body()
