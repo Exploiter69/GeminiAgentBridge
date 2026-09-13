@@ -7,6 +7,9 @@ import binascii
 import io
 from urllib.parse import unquote_to_bytes
 
+from .context import compact_messages
+from .grounding import GroundingFacts
+
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
 
 
@@ -18,30 +21,20 @@ def _compress_b64_if_needed(b64: str) -> str:
         from PIL import Image
         img_data = base64.b64decode(b64)
         img = Image.open(io.BytesIO(img_data))
-        # Resize to max 256px on longest side
         max_dim = 256
         ratio = min(max_dim / img.width, max_dim / img.height)
         if ratio < 1:
             img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
-        # Convert to JPEG with quality reduction
         buf = io.BytesIO()
         img.convert("RGB").save(buf, format="JPEG", quality=60)
         compressed = base64.b64encode(buf.getvalue()).decode()
         return compressed
     except Exception:
-        # If PIL not available, truncate (model will get partial data)
         return b64[:MAX_IMAGE_B64_SIZE]
 
 
 def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
-    """Build tool_choice constraint instruction.
-
-    tool_choice values:
-      - "none": do not call any tool
-      - "auto": decide whether to call tools (default)
-      - "required": must call at least one tool
-      - {"type": "function", "function": {"name": "xxx"}}: must call specific tool
-    """
+    """Build tool_choice constraint instruction."""
     if tool_choice == "none":
         return "\n\nIMPORTANT: Do NOT call any tools. Respond with text only."
     if tool_choice == "required":
@@ -101,13 +94,27 @@ def _image_from_part(part: dict):
     return None
 
 
-def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
+def messages_to_prompt(
+    messages: list,
+    tools: list = None,
+    tool_choice=None,
+    grounding: GroundingFacts | None = None,
+    max_chars: int | None = None,
+) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
-    Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
+    ``grounding`` contains only explicit downstream facts. ``max_chars`` is a
+    configurable soft budget; when set, deterministic compaction preserves the
+    system contract, current task, and recent tool state.
     """
+    if max_chars and max_chars > 0:
+        messages, _ = compact_messages(messages, max_chars)
+
     parts = []
     images = []
+
+    if grounding and grounding.is_explicit:
+        parts.append(grounding.to_prompt())
 
     if tools and tool_choice != "none":
         tool_defs = []
@@ -234,10 +241,7 @@ def _google_tool_choice_instruction(req: dict) -> str:
 
 
 def google_contents_to_prompt(req: dict) -> tuple:
-    """Convert Google API contents/tools/systemInstruction to (prompt_str, images_list).
-
-    Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
-    """
+    """Convert Google API contents/tools/systemInstruction to (prompt_str, images_list)."""
     parts = []
     images = []
 
@@ -305,15 +309,7 @@ def google_contents_to_prompt(req: dict) -> tuple:
 
 
 def parse_google_function_calls(text: str) -> tuple:
-    """Extract function_call blocks from model output.
-
-    Handles 3 formats:
-    1. ```function_call\\n{...}\\n``` (standard)
-    2. function_call\\n{...} (without backticks)
-    3. Raw JSON with "name" + "args" keys
-
-    Returns (clean_text, [{"name": ..., "args": ...}])
-    """
+    """Extract function_call blocks from model output."""
     function_calls = []
     pattern1 = r'```function_call\s*\n(.*?)\n```'
     pattern2 = r'(?:^|\n)function_call\s*\n(\{[^`]*?\})'
