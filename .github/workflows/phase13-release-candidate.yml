@@ -1,0 +1,34 @@
+name: Phase 13 Release Candidate
+
+on:
+  push:
+    branches: [phase13-release-candidate]
+  pull_request:
+    branches: [phase7-planner, main]
+
+jobs:
+  release-candidate:
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Phase 13 focused tests
+        run: python -m unittest tests.test_phase13_release_candidate -v
+      - name: Independent release candidate gate
+        run: python scripts/phase13_release_candidate.py
+      - name: Upload release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase13-release-candidate-${{ matrix.python }}
+          path: |
+            artifacts/phase13-release-candidate.json
+            artifacts/phase13-release-candidate.sha256
+          if-no-files-found: ignore
