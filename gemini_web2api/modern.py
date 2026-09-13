@@ -1,10 +1,4 @@
-"""Modern Gemini Web transport backed by the maintained gemini-webapi client.
-
-The original bridge used the legacy StreamGenerate HTTP endpoint directly. Google
-has changed the Gemini Web transport repeatedly, so the bridge keeps the legacy
-protocol implementation for explicit compatibility but uses gemini-webapi as the
-live transport by default. This module contains no downstream tool execution.
-"""
+"""Modern Gemini Web transport backed by the maintained gemini-webapi client."""
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +12,7 @@ from .config import CONFIG
 
 try:
     from gemini_webapi import GeminiClient
-except ImportError:  # pragma: no cover - exercised only in minimal installs
+except ImportError:  # pragma: no cover
     GeminiClient = None
 
 
@@ -27,11 +21,14 @@ class ModernBackendUnavailable(RuntimeError):
 
 
 class _ModernBackend:
+    """Own one GeminiClient on one asyncio loop and serialize backend calls."""
+
     def __init__(self) -> None:
         self._loop = None
         self._thread = None
         self._client = None
         self._lock = threading.Lock()
+        self._async_lock = None
         self._started = threading.Event()
 
     def _ensure_loop(self) -> None:
@@ -44,6 +41,7 @@ class _ModernBackend:
             def runner() -> None:
                 self._loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self._loop)
+                self._async_lock = asyncio.Lock()
                 self._started.set()
                 self._loop.run_forever()
                 pending = asyncio.all_tasks(self._loop)
@@ -73,7 +71,10 @@ class _ModernBackend:
             raise
         try:
             return future.result(timeout=timeout)
-        except Exception:
+        except TimeoutError:
+            future.cancel()
+            raise
+        except BaseException:
             future.cancel()
             raise
 
@@ -104,7 +105,7 @@ class _ModernBackend:
                 direct_psidts or pairs.get("__Secure-1PSIDTS", ""),
             )
         except Exception as exc:
-            raise RuntimeError("unable to read Gemini cookie file") from exc
+            raise RuntimeError("unable to read Gemini authentication cookie") from exc
 
     async def _close_client(self) -> None:
         client = self._client
@@ -147,17 +148,28 @@ class _ModernBackend:
             6: "gemini-flash-lite",
         }.get(model_id, "gemini-flash")
 
+    @staticmethod
+    def _is_session_error(exc: Exception) -> bool:
+        text = f"{type(exc).__name__} {exc}".lower()
+        return any(token in text for token in (
+            "unauthenticated", "permission denied", "forbidden", "unauthorized",
+            "auth", "session expired", "invalid session", "model not found",
+        ))
+
     async def _generate_once(self, prompt: str, model_id: int) -> str:
-        client = await self._ensure_client()
-        response = await client.generate_content(
-            prompt,
-            model=self._model_for_mode(model_id),
-            temporary=bool(CONFIG.get("temporary_chats", False)),
-        )
-        text = getattr(response, "text", None) or str(response or "")
-        if not text.strip():
-            raise RuntimeError("Gemini Web returned an empty response")
-        return text
+        if self._async_lock is None:
+            raise RuntimeError("modern Gemini transport lock is unavailable")
+        async with self._async_lock:
+            client = await self._ensure_client()
+            response = await client.generate_content(
+                prompt,
+                model=self._model_for_mode(model_id),
+                temporary=bool(CONFIG.get("temporary_chats", False)),
+            )
+            text = getattr(response, "text", None) or str(response or "")
+            if not text.strip():
+                raise RuntimeError("Gemini Web returned an empty response")
+            return text
 
     async def _generate(self, prompt: str, model_id: int) -> str:
         attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
@@ -165,10 +177,11 @@ class _ModernBackend:
         for attempt in range(attempts):
             try:
                 return await self._generate_once(prompt, model_id)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 last_error = exc
-                name = type(exc).__name__.lower()
-                if "auth" in name or "session" in name or "model" in name:
+                if self._is_session_error(exc):
                     await self._close_client()
                 if attempt + 1 >= attempts:
                     break
@@ -179,16 +192,22 @@ class _ModernBackend:
                 await asyncio.sleep(delay)
         raise last_error
 
-    async def _stream_once(self, prompt: str, model_id: int, out: queue.Queue) -> None:
-        client = await self._ensure_client()
-        async for chunk in client.generate_content_stream(
-            prompt,
-            model=self._model_for_mode(model_id),
-            temporary=bool(CONFIG.get("temporary_chats", False)),
-        ):
-            delta = getattr(chunk, "text_delta", None)
-            if delta:
-                out.put(delta)
+    async def _stream_once(self, prompt: str, model_id: int, out: queue.Queue, state: dict) -> None:
+        if self._async_lock is None:
+            raise RuntimeError("modern Gemini transport lock is unavailable")
+        async with self._async_lock:
+            client = await self._ensure_client()
+            async for chunk in client.generate_content_stream(
+                prompt,
+                model=self._model_for_mode(model_id),
+                temporary=bool(CONFIG.get("temporary_chats", False)),
+            ):
+                delta = getattr(chunk, "text_delta", None)
+                if delta:
+                    state["emitted"] = True
+                    out.put(delta)
+            if not state["emitted"]:
+                raise RuntimeError("Gemini Web returned an empty stream")
 
     def generate(self, prompt: str, model_id: int) -> str:
         return self._run(self._generate(prompt, model_id))
@@ -196,21 +215,26 @@ class _ModernBackend:
     def generate_stream(self, prompt: str, model_id: int):
         out: queue.Queue = queue.Queue()
         sentinel = object()
-        state = {"error": None}
+        state = {"error": None, "emitted": False}
+        self._ensure_loop()
+        loop = self._loop
 
         async def producer():
             attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
             for attempt in range(attempts):
                 try:
-                    await self._stream_once(prompt, model_id, out)
+                    await self._stream_once(prompt, model_id, out, state)
                     out.put(sentinel)
                     return
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
                     state["error"] = exc
-                    name = type(exc).__name__.lower()
-                    if "auth" in name or "session" in name or "model" in name:
+                    if self._is_session_error(exc):
                         await self._close_client()
-                    if attempt + 1 >= attempts:
+                    # Never regenerate after output has crossed the backend boundary:
+                    # a retry could duplicate a tool call or assistant prefix.
+                    if state["emitted"] or attempt + 1 >= attempts:
                         break
                     await asyncio.sleep(min(
                         float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt),
@@ -218,27 +242,39 @@ class _ModernBackend:
                     ))
             out.put(sentinel)
 
-        self._ensure_loop()
-        asyncio.run_coroutine_threadsafe(producer(), self._loop)
-        while True:
-            item = out.get()
-            if item is sentinel:
-                if state["error"] is not None:
-                    raise state["error"]
-                return
-            yield item
+        future = asyncio.run_coroutine_threadsafe(producer(), loop)
+        try:
+            while True:
+                item = out.get()
+                if item is sentinel:
+                    error = state["error"]
+                    if error is not None:
+                        raise error
+                    return
+                yield item
+        except (GeneratorExit, KeyboardInterrupt):
+            future.cancel()
+            raise
+        finally:
+            if not future.done():
+                future.cancel()
 
     def shutdown(self) -> None:
         with self._lock:
             loop = self._loop
             thread = self._thread
-            self._client = None
             if not loop or not thread:
                 return
             if loop.is_closed() or not thread.is_alive():
                 self._loop = None
                 self._thread = None
+                self._client = None
                 return
+            try:
+                close_future = asyncio.run_coroutine_threadsafe(self._close_client(), loop)
+                close_future.result(timeout=5)
+            except Exception:
+                pass
             try:
                 loop.call_soon_threadsafe(loop.stop)
             except RuntimeError:
@@ -247,6 +283,8 @@ class _ModernBackend:
                 thread.join(timeout=5)
             self._loop = None
             self._thread = None
+            self._client = None
+            self._async_lock = None
 
 
 _BACKEND = _ModernBackend()
@@ -254,10 +292,8 @@ atexit.register(_BACKEND.shutdown)
 
 
 def generate(prompt: str, model_id: int) -> str:
-    """Generate through the maintained Gemini Web client."""
     return _BACKEND.generate(prompt, model_id)
 
 
 def generate_stream(prompt: str, model_id: int):
-    """Stream through the maintained Gemini Web client."""
     yield from _BACKEND.generate_stream(prompt, model_id)
