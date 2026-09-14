@@ -91,8 +91,8 @@ def load_cookie() -> tuple:
                 sapisid = pairs.get("SAPISID", "")
             _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
             return cookie_str, sapisid if sapisid else None
-        except Exception as e:
-            log(f"Cookie load error: {type(e).__name__}")
+        except Exception:
+            log("Cookie load error: authentication material could not be parsed")
             return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
@@ -250,14 +250,18 @@ def _sleep_before_retry(policy: RetryPolicy, attempt: int, error: Exception) -> 
         time.sleep(delay)
 
 
-def _legacy_file_refs(files: tuple[BackendFile, ...]) -> list[str]:
+def _legacy_file_refs(files: tuple) -> list[str]:
     if not files:
         return []
-    # Lazy import avoids the multimodal -> gemini import cycle.
     from .multimodal import upload_image
     refs = []
     for item in files:
-        refs.append(upload_image(item.data, item.filename, item.mime_type))
+        data = getattr(item, "data", None)
+        filename = getattr(item, "filename", "attachment.bin")
+        mime_type = getattr(item, "mime_type", "application/octet-stream")
+        if data is None:
+            raise ValueError("legacy backend requires file bytes for each attachment")
+        refs.append(upload_image(data, filename, mime_type))
     return refs
 
 
@@ -307,18 +311,17 @@ def generate(prompt: str, model_id, think_mode=None, file_refs=None, extra_field
         temporary=bool(CONFIG.get("temporary_chats", False)),
         provider_options=extra_fields,
     )
-    if backend != "legacy":
+    if backend == "legacy":
+        return _generate_legacy(request)
+    if backend == "modern":
+        return modern_generate_response(request).text
+    if backend == "auto":
         try:
             return modern_generate_response(request).text
         except ModernBackendUnavailable:
-            if backend == "modern":
-                raise
-            log("Modern Gemini transport unavailable; falling back to legacy transport")
-        except Exception:
-            if backend == "modern":
-                raise
-            log("Modern Gemini transport failed; falling back to legacy transport")
-    return _generate_legacy(request)
+            log("Modern Gemini transport is unavailable; explicit auto mode permits legacy fallback")
+            return _generate_legacy(request)
+    raise ValueError(f"unsupported upstream_backend: {backend}")
 
 
 def generate_stream(prompt: str, model_id, think_mode=None, file_refs=None, extra_fields=None):
@@ -333,19 +336,24 @@ def generate_stream(prompt: str, model_id, think_mode=None, file_refs=None, extr
         temporary=bool(CONFIG.get("temporary_chats", False)),
         provider_options=extra_fields,
     )
-    if backend != "legacy":
+    if backend == "legacy":
+        yield from _legacy_stream(request)
+        return
+    if backend == "modern":
+        yield from modern_generate_stream(request)
+        return
+    if backend == "auto":
         try:
             yield from modern_generate_stream(request)
             return
         except ModernBackendUnavailable:
-            if backend == "modern":
-                raise
-            log("Modern Gemini transport unavailable; falling back to legacy transport")
-        except Exception:
-            if backend == "modern":
-                raise
-            log("Modern Gemini transport failed; falling back to legacy transport")
+            log("Modern Gemini transport is unavailable; explicit auto mode permits legacy fallback")
+            yield from _legacy_stream(request)
+            return
+    raise ValueError(f"unsupported upstream_backend: {backend}")
 
+
+def _legacy_stream(request: BackendRequest):
     if not HAS_HTTPX:
         text = _generate_legacy(request)
         if text:
