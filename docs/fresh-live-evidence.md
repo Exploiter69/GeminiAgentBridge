@@ -5,7 +5,18 @@ for the current repaired transport and must be updated only from fresh local run
 
 ## Authenticated Gemini Web smoke
 
-Status: **NOT RUN**
+Status: **PASS**
+
+Fresh result:
+- `LIVE_GEMINI_WEB_OK`
+- `BACKEND=legacy`
+- `MODEL_RESOLVED=gemini-3.6-flash`
+- `THOUGHTS_PRESENT=False`
+- `LIVE_GEMINI_WEB_STREAM_OK`
+
+The maintained legacy Gemini Web transport successfully generated a semantic
+response and completed the streaming verification on the current
+`fix/full-roadmap` branch.
 
 Required markers after a successful local run:
 
