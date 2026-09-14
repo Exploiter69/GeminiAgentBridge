@@ -71,6 +71,30 @@ class RateLimitRegressionTests(unittest.TestCase):
                     "authentication_error",
                 )
 
+    def test_responses_rate_limit_is_mapped_before_stream_headers(self):
+        exc = self._http_error(429, 19)
+
+        status, payload, headers = GeminiHandler._upstream_error_response(exc)
+
+        self.assertEqual(status, 429)
+        self.assertEqual(payload["error"]["type"], "rate_limit")
+        self.assertEqual(payload["error"]["message"], "upstream rate limit")
+        self.assertEqual(headers["Retry-After"], "19")
+
+    def test_stream_rate_limit_payload_is_safe(self):
+        exc = self._http_error(429, 23)
+
+        status, payload, headers = GeminiHandler._upstream_error_response(exc)
+
+        serialized = str(payload)
+
+        self.assertEqual(status, 429)
+        self.assertEqual(headers["Retry-After"], "23")
+        self.assertNotIn("https://gemini.google.com/", serialized)
+        self.assertNotIn("upstream", serialized.lower().replace(
+            "upstream rate limit", ""
+        ))
+
     def test_unknown_upstream_errors_remain_502(self):
         status, payload, headers = (
             GeminiHandler._upstream_error_response(
