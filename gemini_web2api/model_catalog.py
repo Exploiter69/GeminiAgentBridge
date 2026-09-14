@@ -26,7 +26,6 @@ def openai_models(models: list[Any]) -> list[dict[str, Any]]:
         {
             "id": model_name(model),
             "object": "model",
-            "created": 0,
             "owned_by": "google",
             "description": model_description(model),
         }
