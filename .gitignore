@@ -11,6 +11,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+*.egg-info/
 logs/
 *.log
 artifacts/phase13-release-candidate.json
