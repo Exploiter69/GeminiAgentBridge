@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gemini_web2api.backend import BackendFile
+from gemini_web2api.backend import BackendFile, BackendRequest
 from gemini_web2api.multimodal import UploadedFileRef
 from gemini_web2api.modern import _ModernBackend
 from gemini_web2api.protocol import parse_tool_calls_robust
@@ -80,6 +80,85 @@ class MultimodalCapabilityTests(unittest.TestCase):
                     pass
 
         self.assertFalse(Path(paths[0]).exists())
+
+    def test_modern_generation_failure_cleans_materialized_files(self):
+        import asyncio
+
+        backend = _ModernBackend.__new__(_ModernBackend)
+        backend._async_lock = asyncio.Lock()
+
+        class FailingClient:
+            async def generate_content(self, prompt, **kwargs):
+                raise RuntimeError("synthetic generation failure")
+
+        async def ensure_client():
+            return FailingClient()
+
+        backend._ensure_client = ensure_client
+
+        request = BackendRequest(
+            prompt="test",
+            model="gemini-test",
+            files=(
+                BackendFile(
+                    data=b"failure-cleanup",
+                    mime_type="application/octet-stream",
+                    filename="failure.bin",
+                ),
+            ),
+        )
+
+        async def exercise():
+            with self.assertRaises(RuntimeError):
+                await backend._generate_once(request)
+
+        asyncio.run(exercise())
+
+        leftovers = list(Path(tempfile.gettempdir()).glob("gemini-bridge-*"))
+        self.assertEqual(leftovers, [])
+
+    def test_modern_stream_failure_cleans_materialized_files(self):
+        import asyncio
+
+        backend = _ModernBackend.__new__(_ModernBackend)
+        backend._async_lock = asyncio.Lock()
+
+        class FailingClient:
+            async def generate_content_stream(self, prompt, **kwargs):
+                if False:
+                    yield None
+                raise RuntimeError("synthetic stream failure")
+
+        async def ensure_client():
+            return FailingClient()
+
+        backend._ensure_client = ensure_client
+
+        request = BackendRequest(
+            prompt="test",
+            model="gemini-test",
+            stream=True,
+            files=(
+                BackendFile(
+                    data=b"stream-cleanup",
+                    mime_type="application/octet-stream",
+                    filename="stream.bin",
+                ),
+            ),
+        )
+
+        import queue
+
+        async def exercise():
+            out = queue.Queue()
+            state = {"error": None, "emitted": False, "thoughts_delta": ""}
+            with self.assertRaises(RuntimeError):
+                await backend._stream_once(request, out, state)
+
+        asyncio.run(exercise())
+
+        leftovers = list(Path(tempfile.gettempdir()).glob("gemini-bridge-*"))
+        self.assertEqual(leftovers, [])
 
     def test_distinct_multiple_tool_calls_are_preserved(self):
         raw = (
