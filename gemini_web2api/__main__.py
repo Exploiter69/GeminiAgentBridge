@@ -5,8 +5,10 @@ import os
 from .config import CONFIG, load_config, find_config
 from .models import MODELS
 from .gemini import HAS_HTTPX
+from .server import GeminiHandler
 from .hardened_server import HardenedGeminiHandler, HardenedThreadedServer
 from .security import validate_bind
+from .phase4_runtime import install_phase4_runtime
 from . import __version__
 
 
@@ -34,8 +36,23 @@ def main():
         CONFIG["proxy"] = args.proxy
 
     validate_bind(str(CONFIG["host"]), CONFIG.get("api_keys") or [])
-    if not CONFIG.get("cookie_file"):
-        raise SystemExit("Gemini Web authentication cookie is required for the modern backend")
+
+    backend = str(CONFIG.get("upstream_backend", "modern")).lower()
+    if backend not in {"modern", "legacy", "auto"}:
+        raise SystemExit(
+            f"Unsupported upstream_backend: {backend!r}. "
+            "Expected one of: modern, legacy, auto"
+        )
+    if backend == "modern" and not CONFIG.get("cookie_file"):
+        raise SystemExit(
+            "Gemini Web authentication cookie is required for the modern backend"
+        )
+
+    # The hardened handler inherits the actual Chat/Responses implementation
+    # from GeminiHandler.  Phase 4/5/6 must be installed on that owner module,
+    # not on hardened_server, otherwise server.generate/parse_tool_calls remain
+    # unwrapped and malformed Gemini tool calls become opaque HTTP 500s.
+    install_phase4_runtime(GeminiHandler)
 
     port = int(CONFIG["port"])
     server = HardenedThreadedServer((CONFIG["host"], port), HardenedGeminiHandler)
@@ -43,11 +60,12 @@ def main():
     print(f"  Listening: http://{CONFIG['host']}:{port}")
     print(f"  Base URL:  http://{CONFIG['host']}:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
-    print("  Backend:   modern gemini-webapi")
+    print(f"  Backend:   {backend}")
     print("  Auth:      local-only by default; API keys required for remote bind")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'buffered fallback'}")
     print(f"  Body limit: {int(CONFIG['max_request_body_bytes'])} bytes")
     print(f"  Image limit: {int(CONFIG['max_image_bytes'])} bytes")
+    print("  Recovery:   Phase 4/5/6 tool-call recovery enabled")
     print()
     try:
         server.serve_forever()
