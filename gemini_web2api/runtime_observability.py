@@ -7,6 +7,9 @@ import json
 import sys
 import time
 
+from .config import CONFIG
+from .model_catalog import google_models, openai_models
+from .modern import _BACKEND
 from .observability import TRACE_HEADER, emit_event, new_trace_id
 from .response_semantics import remove_fabricated_usage, sanitize_sse_event
 
@@ -64,6 +67,23 @@ def _install_stream_failure_marker(handler_cls) -> None:
     module._bridge_stream_failure_installed = True
 
 
+def _dynamic_models(self, path: str) -> bool:
+    """Serve account-discovered modern models; return False to use legacy/static path."""
+    if str(CONFIG.get("upstream_backend", "modern")).lower() != "modern":
+        return False
+    if path not in {"/v1/models", "/v1beta/models"}:
+        return False
+    if not self._authorized():
+        self.send_json({"error": {"message": "invalid api key"}}, 401)
+        return True
+    models = _BACKEND.list_models()
+    if path == "/v1/models":
+        self.send_json({"object": "list", "data": openai_models(models)})
+    else:
+        self.send_json({"models": google_models(models)})
+    return True
+
+
 def install_observability(handler_cls) -> None:
     """Install bounded trace lifecycle and response semantic guards."""
     if getattr(handler_cls, "_bridge_observability_installed", False):
@@ -92,7 +112,10 @@ def install_observability(handler_cls) -> None:
         started = time.monotonic()
         emit_event(trace_id, "request_received", method="GET", path=self.path)
         try:
-            result = original_do_get(self)
+            if _dynamic_models(self, self.path):
+                result = None
+            else:
+                result = original_do_get(self)
             emit_event(trace_id, "request_completed", method="GET", path=self.path, duration_ms=int((time.monotonic() - started) * 1000))
             return result
         except Exception as exc:
