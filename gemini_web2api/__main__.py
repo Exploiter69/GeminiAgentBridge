@@ -5,6 +5,7 @@ import os
 from .config import CONFIG, load_config, find_config
 from .models import MODELS
 from .gemini import HAS_HTTPX
+from .modern import health as modern_health, shutdown as modern_shutdown
 from .server import GeminiHandler
 from .hardened_server import HardenedGeminiHandler, HardenedThreadedServer
 from .security import validate_bind
@@ -26,10 +27,14 @@ def main():
     config_path = args.config or os.environ.get("GEMINI_WEB2API_CONFIG") or find_config()
     if config_path:
         load_config(config_path)
-    if args.port is not None: CONFIG["port"] = args.port
-    if args.host is not None: CONFIG["host"] = args.host
-    if args.cookie_file: CONFIG["cookie_file"] = args.cookie_file
-    if args.proxy: CONFIG["proxy"] = args.proxy
+    if args.port is not None:
+        CONFIG["port"] = args.port
+    if args.host is not None:
+        CONFIG["host"] = args.host
+    if args.cookie_file:
+        CONFIG["cookie_file"] = args.cookie_file
+    if args.proxy:
+        CONFIG["proxy"] = args.proxy
 
     validate_bind(str(CONFIG["host"]), CONFIG.get("api_keys") or [])
     backend = str(CONFIG.get("upstream_backend", "modern")).lower()
@@ -57,6 +62,7 @@ def main():
     print(f"  Image limit: {int(CONFIG['max_image_bytes'])} bytes")
     print("  Recovery:   Phase 4/5/6 tool-call recovery enabled")
     print("  Tracing:    safe request lifecycle observability enabled")
+    print(f"  Backend health: {modern_health().state.value}")
     print()
     try:
         server.serve_forever()
@@ -65,6 +71,7 @@ def main():
     finally:
         server.shutdown()
         server.server_close()
+        modern_shutdown()
 
 
 if __name__ == "__main__":
