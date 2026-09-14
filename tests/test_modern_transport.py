@@ -1,5 +1,3 @@
-import asyncio
-import json
 import os
 import tempfile
 import unittest
@@ -25,6 +23,7 @@ class FakeClient:
         self.closed = False
         self.initialized = False
         self.calls = []
+        self.file_snapshots = []
         self.__class__.instances.append(self)
 
     async def init(self, **kwargs):
@@ -42,6 +41,9 @@ class FakeClient:
 
     async def generate_content(self, prompt, **kwargs):
         self.calls.append(("generate", prompt, kwargs))
+        for path in kwargs.get("files", []):
+            with open(path, "rb") as handle:
+                self.file_snapshots.append(handle.read())
         return FakeResponse()
 
     async def generate_content_stream(self, prompt, **kwargs):
@@ -81,12 +83,7 @@ class ModernTransportTests(unittest.TestCase):
         try:
             CONFIG["cookie_file"] = path
             with patch.object(modern, "GeminiClient", FakeClient):
-                request = BackendRequest(
-                    prompt="inspect image",
-                    model="gemini-3.6-flash",
-                    files=(BackendFile(b"PNGDATA", "image/png", "photo.png"),),
-                    temporary=True,
-                )
+                request = BackendRequest(prompt="inspect image", model="gemini-3.6-flash", files=(BackendFile(b"PNGDATA", "image/png", "photo.png"),), temporary=True)
                 result = modern._BACKEND.generate_response(request)
             self.assertIsInstance(result, BackendResponse)
             self.assertEqual(result.text, "modern response")
@@ -96,8 +93,7 @@ class ModernTransportTests(unittest.TestCase):
             self.assertEqual(kwargs["model"], "resolved:gemini-3.6-flash")
             self.assertTrue(kwargs["temporary"])
             self.assertEqual(len(kwargs["files"]), 1)
-            with open(kwargs["files"][0], "rb") as handle:
-                self.assertEqual(handle.read(), b"PNGDATA")
+            self.assertEqual(client.file_snapshots, [b"PNGDATA"])
             self.assertFalse(os.path.exists(kwargs["files"][0]))
         finally:
             os.unlink(path)
