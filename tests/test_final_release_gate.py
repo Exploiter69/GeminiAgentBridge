@@ -19,6 +19,21 @@ class FinalReleaseGateTests(unittest.TestCase):
         self.assertIn("never printed", text)
         self.assertNotIn("read_text(encoding=\"utf-8\")", text[text.find("args.cookie_file"):])
 
+    def test_credential_gate_checks_git_tracking_not_local_existence(self):
+        text = (ROOT / "scripts/final_release_gate.py").read_text(encoding="utf-8")
+        self.assertIn('git", "ls-files", "--error-unmatch"', text)
+        self.assertNotIn(
+            'not any((ROOT / name).exists() for name in ("config.json", ".env", "cookie.txt"))',
+            text,
+        )
+
+    def test_streamed_tool_calls_use_separate_terminal_finish_chunk(self):
+        text = (ROOT / "gemini_web2api/server.py").read_text(encoding="utf-8")
+        self.assertIn('emit_stream_chunk({"role": "assistant"})', text)
+        self.assertIn('"tool_calls": [{', text)
+        self.assertIn('emit_stream_chunk({}, "tool_calls")', text)
+        self.assertIn('emit_stream_chunk({}, "stop")', text)
+
     def test_release_document_exists(self):
         self.assertTrue((ROOT / "docs/RELEASE.md").is_file())
         self.assertIn("--live", (ROOT / "docs/RELEASE.md").read_text(encoding="utf-8"))

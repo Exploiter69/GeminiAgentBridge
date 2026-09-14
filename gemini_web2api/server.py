@@ -332,9 +332,49 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._start_sse()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+
+            # Keep OpenAI-compatible streaming semantics explicit. Tool calls
+            # are delivered as deltas and the terminal finish_reason is a
+            # separate chunk so AI SDK/OpenCode can accumulate the call before
+            # advancing the agent loop.
+            def emit_stream_chunk(delta, finish_reason=None):
+                chunk = {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": finish_reason,
+                    }],
+                }
+                self.wfile.write(
+                    f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+                )
+
+            emit_stream_chunk({"role": "assistant"})
+
+            if tool_calls:
+                for index, call in enumerate(tool_calls):
+                    function = call.get("function", {})
+                    emit_stream_chunk({
+                        "tool_calls": [{
+                            "index": index,
+                            "id": call.get("id", f"call_{index}"),
+                            "type": "function",
+                            "function": {
+                                "name": function.get("name", ""),
+                                "arguments": function.get("arguments", "{}"),
+                            },
+                        }]
+                    })
+                emit_stream_chunk({}, "tool_calls")
+            else:
+                if msg.get("content"):
+                    emit_stream_chunk({"content": msg["content"]})
+                emit_stream_chunk({}, "stop")
+
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:

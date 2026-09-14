@@ -62,7 +62,25 @@ def main() -> int:
         parser.error("--live and --ci are mutually exclusive")
 
     add("repository", (ROOT / ".git").is_dir(), str(ROOT))
-    add("credential_files_not_tracked", not any((ROOT / name).exists() for name in ("config.json", ".env", "cookie.txt")), "no local credential fixture is present in the checkout")
+    credential_files = ("config.json", ".env", "cookie.txt")
+    tracked_credentials = []
+    for name in credential_files:
+        probe = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", name],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if probe.returncode == 0:
+            tracked_credentials.append(name)
+    add(
+        "credential_files_not_tracked",
+        not tracked_credentials,
+        "credential-named files are not tracked by git"
+        if not tracked_credentials
+        else "tracked credential-named files: " + ", ".join(tracked_credentials),
+    )
 
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     add("packaging_metadata", all(x in pyproject for x in (
