@@ -9,7 +9,6 @@ from typing import Any
 
 _SENTINEL_RE = re.compile(r"@@TOOL_CALL@@\s*(?P<body>.*?)\s*@@END_TOOL_CALL@@", re.DOTALL)
 _FENCED_RE = re.compile(r"```tool_call\s*(?:\n)?(?P<body>.*?)\s*```", re.DOTALL | re.IGNORECASE)
-_RAW_FUNCTION_RE = re.compile(r"(?:^|\n)tool_call\s*(?:\n)?(?P<body>\{.*?\})", re.DOTALL)
 
 STRICT_TOOL_PROTOCOL = (
     "# Strict Tool Use Protocol\n\n"
@@ -51,11 +50,50 @@ def clear_tool_context() -> None:
             delattr(_tool_context, attr)
 
 
+def _balanced_json_objects(text: str) -> list[tuple[int, int, str]]:
+    """Find balanced JSON objects while respecting quoted strings/escapes."""
+    found = []
+    for start in (m.start() for m in re.finditer(r"\{", text)):
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    found.append((start, index + 1, text[start:index + 1]))
+                    break
+    return found
+
+
 def _candidate_objects(text: str) -> list[tuple[int, int, str]]:
     found: list[tuple[int, int, str]] = []
-    for pattern in (_SENTINEL_RE, _FENCED_RE, _RAW_FUNCTION_RE):
+    occupied: list[tuple[int, int]] = []
+    for pattern in (_SENTINEL_RE, _FENCED_RE):
         for match in pattern.finditer(text):
             found.append((match.start(), match.end(), match.group("body")))
+            occupied.append((match.start(), match.end()))
+    for start, end, body in _balanced_json_objects(text):
+        # Raw JSON is only considered a tool candidate if it looks like one;
+        # this avoids deleting ordinary JSON answers from assistant content.
+        if '"name"' not in body or ('"arguments"' not in body and '"args"' not in body):
+            continue
+        if any(a <= start < b for a, b in occupied):
+            continue
+        found.append((start, end, body))
     found.sort(key=lambda item: item[0])
     return found
 
@@ -124,12 +162,7 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
 
 
 def _schema_type_ok(value: Any, schema_type: str) -> bool:
-    return {
-        "object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str),
-        "integer": isinstance(value, int) and not isinstance(value, bool),
-        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
-        "boolean": isinstance(value, bool), "null": value is None,
-    }.get(schema_type, True)
+    return {"object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str), "integer": isinstance(value, int) and not isinstance(value, bool), "number": isinstance(value, (int, float)) and not isinstance(value, bool), "boolean": isinstance(value, bool), "null": value is None}.get(schema_type, True)
 
 
 def _validate_value(value: Any, schema: dict[str, Any], path: str) -> list[str]:
@@ -191,7 +224,6 @@ def validate_tool_calls(tool_calls: list[dict[str, Any]], tool_defs: list[dict[s
 
 
 def tool_choice_name(tool_choice: Any) -> str | None:
-    """Return the explicitly requested function name, if any."""
     if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
         fn = tool_choice.get("function")
         if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"].strip():
@@ -200,7 +232,6 @@ def tool_choice_name(tool_choice: Any) -> str | None:
 
 
 def validate_tool_choice(tool_choice: Any, tool_defs: list[dict[str, Any]] | None = None) -> list[str]:
-    """Validate OpenAI tool_choice without inferring or inventing tool intent."""
     if tool_choice in (None, "auto", "none", "required"):
         if tool_choice == "required" and not tool_defs:
             return ["tool_choice=required cannot be satisfied without tools"]
@@ -222,23 +253,15 @@ def _attempted_tool_marker(text: str) -> bool:
 def response_needs_repair(text: str, tool_calls: list[dict[str, Any]], tool_defs: list[dict[str, Any]], tool_choice: Any = "auto") -> bool:
     attempted = _attempted_tool_marker(text)
     validation_errors = validate_tool_calls(tool_calls, tool_defs)
-
     if tool_choice == "none":
-        # Explicit client intent: no tool call may cross the protocol boundary.
         return attempted or bool(tool_calls)
-
     requested = tool_choice_name(tool_choice)
     if requested:
         if not tool_calls:
             return True
         if any(call.get("function", {}).get("name") != requested for call in tool_calls):
             return True
-
-    return (
-        (attempted and not tool_calls)
-        or bool(validation_errors)
-        or (tool_choice == "required" and not tool_calls)
-    )
+    return (attempted and not tool_calls) or bool(validation_errors) or (tool_choice == "required" and not tool_calls)
 
 
 def build_repair_prompt(original_prompt: str, errors: list[str], tool_choice: Any = "auto", tool_defs: list[dict[str, Any]] | None = None) -> str:
