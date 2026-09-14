@@ -1,311 +1,743 @@
-# GeminiAgentBridge — Detailed Fixing Roadmap
+# GeminiAgentBridge — Capability Preservation & Fix Roadmap
 
-> Status: engineering roadmap, based on the current repository audit.
+> **Status:** active engineering plan
 >
-> This document is intentionally a **plan**, not a claim that the listed fixes are already implemented.
+> **Purpose:** repair GeminiAgentBridge after the original `gemini-web2api` architecture audit, while preserving useful upstream capabilities instead of replacing one limitation with another.
 >
-> Primary target: make GeminiAgentBridge reliable infrastructure for OpenCode, Hermes, Codex-style and other OpenAI-compatible coding agents using Gemini Web as the model backend.
+> **Baseline:** `main` at `d217f2a` (`fix: activate tool-call recovery in production launcher`).
+>
+> **Important:** this document is a plan. A checked item means the implementation and its regression tests are complete; tests alone are not sufficient when a live Gemini Web capability is involved.
 
 ---
 
-## 0. Non-negotiable architecture
+## 1. Goal
+
+GeminiAgentBridge exists to provide a reliable OpenAI-compatible HTTP interface over Gemini Web for agentic clients such as Hermes, OpenCode, Codex-style clients, and other coding agents.
+
+The target is **not** merely to make one demo request succeed. The target is:
 
 ```text
-Coding agent (OpenCode / Hermes / Codex-style client)
-                    |
-                    | OpenAI-compatible HTTP
-                    v
-            GeminiAgentBridge
-      +-------------------------------+
-      | HTTP/API layer                |
-      | request validation            |
-      | authentication                |
-      | OpenAI protocol normalization |
-      | tool-call protocol            |
-      | context management            |
-      | SSE lifecycle                 |
-      | retries/recovery              |
-      | observability                 |
-      +---------------+---------------+
-                      |
-                backend interface
-                      |
-             +--------+---------+
-             |                  |
-       Modern backend      Legacy backend
-             |             (deprecated)
-       gemini-webapi
-             |
-        Gemini Web
-
-The bridge MUST NOT execute filesystem, shell, git, browser, or other agent tools.
-The downstream agent remains the tool executor and owns the authoritative trajectory.
+OpenAI-compatible agent
+        |
+        v
+GeminiAgentBridge
+        |
+        +-- request/protocol normalization
+        +-- security boundaries
+        +-- tool-call protocol recovery
+        +-- streaming/SSE correctness
+        +-- context management
+        |
+        v
+Backend abstraction
+        |
+        +-- Modern Gemini Web backend (primary)
+        +-- Legacy backend (compatibility/deprecated)
+        |
+        v
+Gemini Web
 ```
 
-### Architectural rules
+The downstream agent remains the owner of:
 
-1. `repair-live-gemini-web` is the current release-candidate line until its work is merged into `main`.
-2. Modern Gemini Web transport is the default and primary implementation.
-3. Legacy `StreamGenerate` remains isolated and explicitly deprecated for compatibility only.
-4. The bridge is stateless with respect to agent trajectories unless a feature explicitly requires otherwise.
-5. The downstream agent owns tool execution and workspace state.
-6. No credential/cookie/session values may appear in logs, errors, tests, fixtures, screenshots, or documentation.
-7. Live Gemini Web success must never be claimed based only on offline tests.
+- filesystem operations
+- shell commands
+- git operations
+- browser actions
+- tool execution
+- workspace state
+- authoritative agent trajectory
+
+The bridge translates and transports requests; it must not silently invent workspace state or execute downstream agent tools.
 
 ---
 
-# Phase 0 — Repository stabilization
+# 2. Audit conclusions — what must be fixed
 
-**Priority: P0 / blocker**
+The repository audit compared the original `Sophomoresty/gemini-web2api` implementation with GeminiAgentBridge. The major conclusion is:
 
-## 0.1 Establish the release branch
+> The modernization direction is correct, but the modern backend was implemented too narrowly and silently dropped capabilities that existed in the original path.
 
-- Treat `repair-live-gemini-web` as the working release candidate.
-- Compare it against current `main` before every merge/rebase.
-- Preserve useful historical tests and compatibility behavior, but do not restore obsolete production paths accidentally.
-- Merge to `main` only after the P0/P1 gates below pass.
+### Confirmed issues
 
-### Exit criteria
+| ID | Issue | Priority | State |
+|---|---|---:|---|
+| CP-01 | Modern backend drops uploaded `file_refs` / multimodal inputs | P0 | Open |
+| CP-02 | Model catalog advertises distinctions that modern transport collapses | P0 | Open |
+| CP-03 | Thinking/reasoning model semantics are not preserved end-to-end | P0 | Open |
+| CP-04 | Backend interface does not preserve all original request capabilities | P0 | Open |
+| CP-05 | Tool-call recovery is bounded recovery, not a guarantee of valid generation | P1 | Document/verify |
+| CP-06 | Raw tool-call fallback relies on fragile regex-style JSON extraction | P1 | Open |
+| CP-07 | Schema compaction may remove semantically useful fields such as `default` | P1 | Open |
+| CP-08 | Context compaction exists but is not a complete/default long-context solution | P1 | Open |
+| CP-09 | Phase 10+ code exists but is not necessarily installed in production | P1 | Open |
+| CP-10 | Observability implementation and production activation/documentation are not fully aligned | P1 | Open |
+| CP-11 | Top-level launcher/module compatibility changed and needs explicit documentation/tests | P1 | Open |
+| CP-12 | Full agentic compatibility has not been demonstrated against real Gemini Web failure cases | P0 | Open |
 
-- `main` and release candidate agree on the intended 2.x architecture.
-- A clean clone launches the modern backend by default.
-- Legacy code cannot become the production path accidentally.
+### Changes we should keep
 
-## 0.2 Repository inventory
+These were improvements rather than mistakes:
 
-Create/maintain a machine-readable inventory of:
-
-- entrypoints
-- packages
-- transports
-- configuration files
-- test suites
-- Docker files
-- workflows
-- extension
-- Cloudflare/legacy components
-- documentation
-- compatibility aliases
-
-### Exit criteria
-
-Every executable path has an explicit owner, purpose, status, and deprecation state.
-
----
-
-# Phase 1 — Security hardening
-
-**Priority: P0 / do before live-agent exposure**
-
-## 1.1 Safe network defaults
-
-Change the default development bind from remote exposure to loopback.
-
-Target:
-
-```text
-host = 127.0.0.1
-```
-
-For container/remote deployment:
-
-```text
-host = 0.0.0.0
-API authentication = mandatory
-```
-
-### Exit criteria
-
-- Unconfigured bridge is not remotely reachable.
-- Remote bind without authentication is rejected at startup.
-
-## 1.2 API authentication
-
-Define one canonical authentication layer.
-
-Requirements:
-
+- loopback-safe default binding
+- mandatory authentication for remote binding
 - constant-time API-key comparison
-- no key values in logs
-- missing/invalid key returns structured 401
-- configuration validation rejects accidental insecure production mode
-- compatibility aliases share the same auth middleware
+- SSRF protections
+- bounded request/image bodies
+- secret-safe diagnostics
+- structured error handling
+- long-lived modern async client lifecycle
+- explicit production activation of Phase 4/5/6 recovery
+- strict tool-schema validation
+- downstream ownership of tool execution
 
-## 1.3 SSRF protection
-
-Remote image fetching must not allow arbitrary internal network access.
-
-Implement:
-
-- URL scheme allowlist: HTTP/HTTPS only
-- reject localhost
-- reject private IPv4 ranges
-- reject loopback
-- reject link-local
-- reject multicast/reserved ranges
-- reject private/loopback/link-local IPv6
-- resolve DNS and validate every resolved address
-- protect against DNS rebinding
-- validate redirect destinations, not only the first URL
-- use explicit connect/read timeouts
-
-Prefer disabling remote image fetching by default if the feature is not required by target agents.
-
-### Exit criteria
-
-Automated tests prove requests to loopback/private/link-local addresses are blocked.
-
-## 1.4 Bound request bodies
-
-Add a configurable hard limit before reading `Content-Length` bytes.
-
-Target behavior:
-
-```text
-413 Payload Too Large
-```
-
-for oversized requests.
-
-Also protect chunked/unknown-length bodies if supported.
-
-## 1.5 Bound remote image downloads
-
-Do not call unbounded `read()` on arbitrary remote resources.
-
-Implement:
-
-- maximum image bytes
-- streaming read in bounded chunks
-- Content-Length pre-check when available
-- hard timeout
-- decompression/resource protections if applicable
-
-## 1.6 Remove secret-bearing logs
-
-Never log:
-
-- cookies
-- session tokens
-- Authorization values
-- API keys
-- upload-session URLs
-- full proxy URLs containing credentials
-- Gemini authentication material
-
-Replace diagnostic URL logging with opaque IDs or event names.
-
-## 1.7 Error redaction
-
-Client-facing errors must use stable categories rather than raw exception strings.
-
-Example:
-
-```json
-{
-  "error": {
-    "type": "upstream_authentication_error",
-    "message": "The Gemini Web session is not authenticated."
-  }
-}
-```
-
-Detailed exception data stays in protected server logs.
-
-### Phase 1 exit gate
-
-```text
-[ ] loopback default
-[ ] remote auth required
-[ ] SSRF tests pass
-[ ] request size limit pass
-[ ] image size limit pass
-[ ] secret-log scan pass
-[ ] error-redaction tests pass
-```
+Do **not** revert these merely to recover historical behavior.
 
 ---
 
-# Phase 2 — Modern Gemini Web backend correctness
+# 3. Non-negotiable engineering rules
 
-**Priority: P0**
+1. **Preserve capability before adding features.** Every modernization change must be checked against the original behavior and the maintained `gemini-webapi` client capabilities.
+2. **No silent fallback.** A requested model or capability must not quietly become a different model/capability unless compatibility fallback is explicitly requested.
+3. **No fabricated semantics.** Do not invent token counts, model capabilities, tool arguments, tool results, workspace state, or reasoning metadata.
+4. **Bounded recovery only.** Recovery may repair protocol/syntax failures but must not turn into uncontrolled regeneration.
+5. **Tool execution belongs downstream.** The bridge returns tool calls; it does not execute them.
+6. **Never duplicate a side-effecting tool call because of transport retry.** Retry decisions must account for trajectory state.
+7. **No credential material in logs, tests, fixtures, docs, screenshots, or commits.**
+8. **Live claims require live evidence.** Offline tests prove code behavior, not Gemini Web availability.
+9. **Production activation must be explicit.** A phase installer existing in the repository does not mean that phase is active.
+10. **Every compatibility claim must have a test.**
+11. **Prefer an explicit unsupported response over silently degrading a request.**
+12. **Do not delete the legacy path until compatibility coverage proves it is no longer required.**
 
-## 2.1 Define backend interface
+---
 
-Create one explicit interface for unary and streaming generation.
+# 4. Phase 0 — Freeze and establish the audit baseline
+
+**Priority: P0 — do first**
+
+## 4.1 Preserve current known-good baseline
+
+Baseline commit:
+
+```text
+d217f2a fix: activate tool-call recovery in production launcher
+```
+
+Before modifying code:
+
+```bash
+git status --short
+git log --oneline --decorate -5
+pytest -q
+```
+
+Expected baseline:
+
+```text
+167 passed, 5 subtests passed
+```
+
+Keep the existing stash untouched until the capability audit is complete. Do not blindly restore it.
+
+## 4.2 Build a capability inventory
+
+For every request feature, record:
+
+```text
+OpenAI input
+ -> server normalization
+ -> internal representation
+ -> backend adapter
+ -> gemini-webapi call
+ -> Gemini Web behavior
+ -> normalized response
+ -> OpenAI output
+```
+
+Inventory at minimum:
+
+- text messages
+- system/developer messages
+- images
+- files/documents
+- model ID
+- thinking/reasoning options
+- tool definitions
+- tool choice
+- multiple tool calls
+- tool results
+- streaming
+- temporary conversation mode
+- grounding/search options where supported
+- response metadata
+- finish reasons
+- usage information
+- cancellation
+- errors
+
+### Exit gate
+
+No request parameter is allowed to disappear silently between API and backend.
+
+---
+
+# 5. Phase 1 — Backend abstraction and capability preservation
+
+**Priority: P0 — highest implementation priority**
+
+This is the central correction.
+
+## 5.1 Define an internal request model
+
+Introduce a normalized internal request representation conceptually equivalent to:
+
+```text
+InternalRequest
+├── messages
+├── model
+├── stream
+├── files/images
+├── tools
+├── tool_choice
+├── generation options
+├── thinking/reasoning options
+├── temporary
+├── grounding/search options
+└── provider-specific extensions
+```
+
+The HTTP layer must not directly depend on `gemini-webapi` internals.
+
+## 5.2 Define a backend interface
 
 Conceptually:
 
 ```text
-Backend.generate(request) -> normalized result
-Backend.stream(request) -> async/sync stream of normalized events
-Backend.health() -> backend status
-Backend.close() -> graceful shutdown
+Backend
+├── capabilities()
+├── resolve_model(requested_model)
+├── generate(request)
+├── stream(request)
+├── health()
+└── close()
 ```
 
-The HTTP layer must not know `gemini-webapi` internals.
+The exact Python API can differ, but capability ownership must be explicit.
 
-## 2.2 GeminiClient lifecycle
+## 5.3 Capability negotiation
 
-Use one documented lifecycle:
+Every backend must report what it can actually do.
+
+Example:
 
 ```text
-initialize
-  -> authenticate
-  -> serve
-  -> refresh/reinitialize on recoverable session failure
-  -> close
+text                 yes
+streaming            yes
+images               yes/no
+files                yes/no
+thinking             yes/no
+multiple_tool_calls  yes/no
+native_tools         yes/no
+responses_api        subset/full
 ```
 
-Do not simply drop the client reference during shutdown.
+The API layer uses this matrix to reject unsupported requests instead of silently degrading them.
 
-Explicitly close the upstream client before stopping the background loop.
+---
 
-## 2.3 Concurrency policy
+# 6. Phase 2 — Fix multimodal/file forwarding
 
-The bridge currently uses a long-lived Gemini client from a multithreaded HTTP server.
+**Priority: P0**
 
-Choose and document one model:
+## Problem
 
-### Initial recommended model
+The server can upload/prepare images and produce file references, but the current modern transport path does not preserve those references when calling the modern Gemini client.
+
+Conceptually the broken path is:
 
 ```text
-HTTP worker threads
-        |
-        v
-one background asyncio loop
-        |
-     asyncio.Lock
-        |
-  shared GeminiClient
+OpenAI image/file
+   -> upload
+   -> file_refs
+   -> modern.generate(prompt, model)
+   -> file_refs discarded
 ```
 
-This prioritizes correctness.
+## Required fix
 
-Only remove serialization after real concurrency testing demonstrates that `gemini-webapi` safely supports concurrent calls for the exact operations used.
+Preserve the complete multimodal request through the backend abstraction.
 
-## 2.4 Cancellation
+Verify the maintained Gemini Web client API for the exact supported file/image argument shape before implementation. Do not guess a parameter name.
 
-Client disconnect must propagate toward the upstream generation where possible.
+Support, where the backend permits:
 
-Required behavior:
+- image URLs/data
+- uploaded files
+- documents
+- multiple attachments
+- MIME types
+- attachment ordering
+- attachment + text combinations
+- streaming with attachments
+
+## Tests
+
+Add mocked backend tests proving:
 
 ```text
-agent disconnects
-   -> HTTP stream closes
-   -> bridge cancellation event
-   -> upstream generation cancelled
-   -> resources released
+input image -> backend receives image/file reference
+multiple images -> order preserved
+file + text -> both preserved
+large/invalid attachment -> deterministic error
 ```
 
-Add tests for:
+Add a live smoke test only after mocked coverage is complete.
 
-- disconnect before first token
-- disconnect during stream
-- disconnect after tool-call detection
-- shutdown during generation
+### Exit gate
 
-## 2.5 Session health/recovery
+No attachment is silently discarded.
+
+---
+
+# 7. Phase 3 — Correct model resolution
+
+**Priority: P0**
+
+## Problem
+
+The public model catalog contains several model IDs and thinking variants, while the modern backend currently collapses many of them to broad Flash/Pro modes.
+
+That creates false capability claims.
+
+## Required design
+
+Separate three concepts:
+
+```text
+requested bridge model ID
+        ↓
+model resolver
+        ↓
+actual account-available Gemini model
+```
+
+Use the maintained Gemini Web client/account model discovery where possible.
+
+## Rules
+
+### Known model
+
+Resolve deterministically.
+
+### Unknown model
+
+Return a structured unsupported/invalid-model response by default.
+
+### Compatibility alias
+
+Only use fallback when the model catalog explicitly marks the ID as an alias.
+
+### Account unavailable
+
+If a model is not available to the authenticated Gemini account, report that instead of pretending another model was used.
+
+## Model metadata
+
+Do not advertise:
+
+- thinking support
+- context limits
+- multimodal support
+- streaming
+- model identity
+
+unless the selected backend actually supports them.
+
+## Tests
+
+- every advertised model resolves
+- unknown model rejected
+- alias behavior explicit
+- model field in response matches actual selected model
+- account-unavailable model handled deterministically
+
+### Exit gate
+
+The API model catalog and backend behavior describe the same capabilities.
+
+---
+
+# 8. Phase 4 — Preserve thinking/reasoning semantics
+
+**Priority: P0**
+
+Audit the original model configuration and current modern client for:
+
+- thinking modes
+- reasoning effort
+- model-specific generation options
+- extra fields
+- temporary mode
+- provider-specific options
+
+Create an explicit mapping table:
+
+```text
+Bridge option
+ -> modern client equivalent
+ -> legacy equivalent
+ -> unsupported behavior
+```
+
+If a modern Gemini Web model does not expose an equivalent, do not silently claim that the option is active.
+
+Possible behavior:
+
+```text
+supported -> pass through
+unsupported optional -> ignore only in explicit compatibility mode
+unsupported required -> structured 400
+```
+
+## Tests
+
+Mock the backend and assert every supported reasoning/thinking field reaches the adapter.
+
+For unsupported options, assert deterministic behavior.
+
+### Exit gate
+
+`thinking` model IDs no longer mean only "select some Flash model".
+
+---
+
+# 9. Phase 5 — Tool-call protocol redesign and recovery
+
+**Priority: P0/P1**
+
+The original failure remains central:
+
+```text
+Gemini malformed tool call
+        ↓
+parse_tool_calls()
+        ↓
+ValueError
+        ↓
+HTTP 500
+```
+
+Our Phase 4/5/6 runtime now catches this class of failure in the production launcher. Keep that fix.
+
+But improve the layer carefully.
+
+## 9.1 Canonical representation
+
+Internally normalize to:
+
+```text
+ToolCall
+├── id
+├── name
+└── arguments_json
+```
+
+Downstream agents must never receive internal sentinel syntax.
+
+## 9.2 Parsing order
+
+Use deterministic parsing:
+
+1. canonical structured/sentinel format
+2. fenced compatibility format
+3. brace-aware raw JSON compatibility parser
+4. otherwise treat as ordinary text / repair candidate according to tool choice
+
+## 9.3 Replace fragile raw JSON extraction
+
+Do not use a simple non-greedy regex as the primary raw JSON parser.
+
+Implement a brace/string-aware scanner that understands:
+
+- nested objects
+- nested arrays
+- escaped quotes
+- escaped backslashes
+- braces inside strings
+- multiple JSON objects
+
+## 9.4 Schema validation
+
+Validate:
+
+- known tool
+- valid JSON arguments
+- required fields
+- types
+- enums
+- additional properties
+- tool-call IDs
+- tool/message ordering
+
+## 9.5 Recovery policy
+
+Recovery is for protocol/syntax errors, not arbitrary model misunderstanding.
+
+Examples:
+
+```text
+malformed JSON          -> repair candidate
+missing required arg    -> repair candidate
+wrong tool under named choice -> repair candidate
+unknown tool             -> reject/repair depending on context
+semantic task failure    -> do not blindly regenerate
+```
+
+Keep repair bounded.
+
+Recommended initial policy:
+
+```text
+original generation: 1
+repair generation:   1
+```
+
+Only increase after evidence and explicit safety analysis.
+
+## 9.6 Tool-choice semantics
+
+Correctly support:
+
+```text
+auto
+none
+required
+named function
+```
+
+`none` must not expose tools to the model.
+
+`required` must produce a tool call when tools exist.
+
+Named choice must produce the requested tool or fail deterministically.
+
+## 9.7 Parallel/multiple calls
+
+Preserve order and IDs for multiple calls.
+
+Explicitly test:
+
+```text
+1 call
+2 calls
+5 calls
+parallel calls
+duplicate calls
+mixed text + tool calls
+```
+
+### Exit gate
+
+The previous malformed-tool-call 500 becomes a bounded protocol recovery/failure rather than an opaque server crash.
+
+---
+
+# 10. Phase 6 — Schema compaction without semantic loss
+
+**Priority: P1**
+
+Schema compaction is useful for large agent toolsets, but must not change the meaning of the schema.
+
+## Preserve semantic fields
+
+At minimum audit preservation of:
+
+- type
+- properties
+- required
+- enum
+- items
+- additionalProperties
+- nullable/union semantics
+- default where meaningful
+- constraints used for argument validity
+
+Only remove metadata that is proven irrelevant to the model/tool protocol.
+
+## Tests
+
+Build before/after semantic comparisons.
+
+For each compacted schema, validate the same accepted/rejected argument examples against the original and compacted form.
+
+### Exit gate
+
+Compaction reduces prompt size without changing tool validity semantics.
+
+---
+
+# 11. Phase 7 — Context and long-horizon agent trajectories
+
+**Priority: P1**
+
+The current compactor is a mechanism, not proof that long-running coding sessions are solved.
+
+## 11.1 Define context budget
+
+Use explicit configurable limits for:
+
+- prompt characters/tokens
+- tool definitions
+- tool outputs
+- file contents
+- total trajectory
+
+## 11.2 Preserve critical state
+
+Compaction priority:
+
+1. system/developer instructions
+2. current user task
+3. active tool calls and tool results
+4. recent assistant trajectory
+5. recent user context
+6. older history
+
+Never invent a summary that claims facts not present in the source trajectory.
+
+## 11.3 Tool-output handling
+
+Large outputs should be bounded and, where possible, summarized by the downstream agent/tool rather than silently truncated by the bridge.
+
+If the bridge truncates, mark it explicitly.
+
+## 11.4 Stress tests
+
+Test:
+
+```text
+10 turns
+20 turns
+50 turns
+100 turns
+large files
+large tool output
+many tool calls
+repeated edit/test loops
+```
+
+Measure:
+
+- prompt size
+- latency
+- failure rate
+- tool-call accuracy
+- context-loss incidents
+
+### Exit gate
+
+Long trajectories degrade predictably rather than failing because of hidden hard limits.
+
+---
+
+# 12. Phase 8 — Streaming/SSE correctness
+
+**Priority: P0**
+
+Streaming is part of agent compatibility, not an optional presentation feature.
+
+## Required lifecycle
+
+```text
+HTTP request
+ -> validate/auth
+ -> backend preflight
+ -> upstream generation
+ -> first meaningful event
+ -> commit SSE
+ -> stream events
+ -> terminal success/error
+```
+
+## Rules
+
+Before HTTP headers are committed, failures should remain normal HTTP errors.
+
+After commitment, HTTP status cannot change, so emit an explicit terminal stream error event.
+
+Never emit successful `[DONE]` semantics after an upstream failure.
+
+Test:
+
+- auth failure before first event
+- timeout before first event
+- upstream 429
+- upstream 5xx
+- malformed tool call during stream
+- disconnect mid-stream
+- shutdown mid-stream
+- empty stream
+- finish reasons
+- multiple tool-call deltas
+
+### Exit gate
+
+OpenAI-compatible streaming clients can distinguish success from failure without guessing.
+
+---
+
+# 13. Phase 9 — Chat Completions and Responses API normalization
+
+**Priority: P0/P1**
+
+Create one internal representation and map it outward.
+
+```text
+Chat Completions ─┐
+                  ├─> InternalRequest/Response ─> Backend
+Responses API ────┘
+```
+
+## Chat Completions matrix
+
+Verify:
+
+- system
+- developer
+- user
+- assistant
+- tool
+- empty content
+- Unicode
+- multimodal content
+- multiple tool calls
+- tool results
+- model
+- finish reason
+- stream/non-stream
+- IDs
+- timestamps
+
+## Responses API
+
+Keep the supported subset explicit.
+
+Do not claim full Responses API compatibility until the complete required lifecycle is implemented and tested.
+
+## `/v1/models`
+
+Model metadata must match the actual backend capability registry.
+
+### Exit gate
+
+A real OpenAI-compatible SDK can use both supported endpoints without provider-specific hacks.
+
+---
+
+# 14. Phase 10 — Session health, retries, and cancellation
+
+**Priority: P1**
 
 Classify upstream failures:
 
@@ -318,807 +750,564 @@ TIMEOUT
 NETWORK
 PROTOCOL
 MODEL_UNAVAILABLE
+CANCELLED
 UNKNOWN
 ```
 
-Only retry errors classified as safe.
+## Retry safety
 
-Authentication failures should trigger controlled reinitialization/refresh rather than an unlimited retry loop.
+Retry only safe failures.
 
-## 2.6 Retry policy
+```text
+No output yet            -> retry may be safe
+Natural-language output  -> normally do not regenerate
+Tool call surfaced       -> do not regenerate
+Tool execution underway  -> never duplicate
+```
 
-Define one bounded policy with:
+Use:
 
-- max attempts
+- bounded attempts
 - exponential backoff
 - jitter
-- retryable exception classes
-- retry-after support where available
-- no retry after unsafe semantic output
+- Retry-After when valid
+- cancellation propagation
 
-### Agent-specific rule
+## Client lifecycle
 
-```text
-No model output yet       -> retry may be safe
-Natural-language output   -> do not blindly regenerate
-Tool call observed        -> do not blindly regenerate
-Tool execution in progress -> never duplicate through retry
-```
-
-## 2.7 Model resolution
-
-Unknown model IDs should not silently fall back in the default mode.
-
-Preferred:
+Maintain one explicit lifecycle:
 
 ```text
-known model -> mapped Gemini model
-unknown     -> structured 400
+initialize
+ -> serve
+ -> recover/reinitialize when safe
+ -> close
 ```
 
-Optional explicit compatibility mode may retain fallback behavior.
+Ensure the async loop and Gemini client are both closed during shutdown.
 
-## 2.8 Temporary-chat policy
+### Exit gate
 
-Default to temporary Gemini conversations unless persistent Gemini history is explicitly requested.
-
-This keeps agent trajectories owned by the downstream client and avoids uncontrolled Gemini account history growth.
-
-### Phase 2 exit gate
-
-```text
-[ ] backend interface isolated
-[ ] client close works
-[ ] concurrency policy documented/tested
-[ ] cancellation tests pass
-[ ] auth refresh/reinit tests pass
-[ ] retry matrix passes
-[ ] unknown-model behavior is deterministic
-```
+No retry can accidentally execute the same side-effecting tool twice.
 
 ---
 
-# Phase 3 — Streaming/SSE correctness
-
-**Priority: P0**
-
-## 3.1 Preflight before HTTP commit
-
-Do not send the initial SSE response merely because the request parsed successfully.
-
-Preferred flow:
-
-```text
-HTTP request
-   -> validate
-   -> auth
-   -> backend/session health
-   -> start upstream generation
-   -> receive first meaningful upstream event
-   -> commit HTTP 200 + SSE
-   -> flush buffered first event
-   -> continue
-```
-
-This provides a clean HTTP error for failures that happen before the first model event.
-
-## 3.2 Post-commit failures
-
-Once SSE is committed, HTTP status cannot be changed.
-
-Therefore define an explicit terminal stream-error event.
-
-Do NOT emit `[DONE]` after a failed stream as if the generation succeeded.
-
-Document the exact event schema and test OpenAI-compatible clients against it.
-
-## 3.3 Empty upstream stream
-
-Define behavior for:
-
-```text
-upstream opens
-no deltas
-stream ends
-```
-
-It must produce a deterministic valid response rather than hanging or emitting an invalid trajectory.
-
-## 3.4 Finish reasons
-
-Map:
-
-```text
-stop
-length
-tool_calls
-content_filter / safety where applicable
-error
-```
-
-to stable OpenAI-compatible values.
-
-## 3.5 Usage reporting
-
-Define whether usage is:
-
-- exact
-- estimated
-- unavailable
-
-Never fabricate token counts.
-
-If unavailable, omit usage or return explicit null semantics supported by the client.
-
-### Phase 3 exit gate
-
-```text
-[ ] pre-first-token auth failure returns HTTP error
-[ ] pre-first-token timeout returns HTTP error
-[ ] mid-stream failure produces terminal stream error
-[ ] no false [DONE] after failure
-[ ] client disconnect cancels upstream
-[ ] empty stream deterministic
-[ ] finish_reason deterministic
-```
-
----
-
-# Phase 4 — OpenAI protocol normalization
-
-**Priority: P0/P1**
-
-Create one canonical internal representation independent of HTTP API version.
-
-```text
-OpenAI request
-    -> InternalRequest
-        -> BackendRequest
-
-BackendResponse
-    -> InternalResponse
-        -> OpenAI Chat/Responses response
-```
-
-## 4.1 Chat Completions
-
-Verify:
-
-- system
-- developer where applicable
-- user
-- assistant
-- tool
-- empty content
-- Unicode
-- multimodal content
-- repeated turns
-- multiple tool calls
-- tool results
-- finish reasons
-- IDs
-- timestamps
-- model field
-
-## 4.2 `/v1/models`
-
-Return stable model metadata.
-
-Do not advertise capabilities that the backend cannot actually provide.
-
-## 4.3 `/v1/responses`
-
-Keep this explicitly documented as a supported subset until all required semantics are implemented.
-
-Do not claim full Responses API compatibility prematurely.
-
-## 4.4 Request validation
-
-Return structured 400 errors for:
-
-- missing messages/input
-- invalid role
-- invalid tool schema
-- malformed JSON arguments
-- unsupported parameter
-- unsupported model
-- invalid tool choice
-
-### Phase 4 exit gate
-
-Run a protocol test matrix against a real OpenAI-compatible client/SDK, not only handcrafted curl requests.
-
----
-
-# Phase 5 — Agent/tool protocol
-
-**Priority: P0/P1**
-
-## 5.1 One canonical tool-call representation
-
-Normalize all accepted Gemini outputs into:
-
-```text
-ToolCall {
-  id
-  name
-  arguments_json
-}
-```
-
-The bridge must never expose internal sentinel formats to downstream agents.
-
-## 5.2 Parsing
-
-Support only intentionally documented formats:
-
-- canonical structured form
-- compatibility fenced form
-- raw JSON compatibility form if required
-
-Order parsing deterministically.
-
-## 5.3 Validation
-
-Validate:
-
-- tool name exists
-- arguments are valid JSON
-- arguments conform to schema where available
-- tool ID is stable
-- no unexpected duplicate IDs
-- no impossible assistant/tool message ordering
-
-## 5.4 Repair
-
-Repair is allowed only for syntax/protocol invalidity.
-
-Repair must not silently change the user's task.
-
-Add tests that prove:
-
-```text
-invalid JSON -> repaired JSON
-wrong tool name -> rejected
-missing required arg -> rejected/repaired
-semantic tool substitution -> rejected
-```
-
-## 5.5 Multiple/parallel calls
-
-Test:
-
-```text
-one call
-2 sequential calls
-2 parallel calls
-5 calls
-mixed tool + text
-```
-
-Define whether the bridge preserves parallel tool calls or serializes them.
-
-## 5.6 Tool-result round trips
-
-Validate the full trajectory:
-
-```text
-assistant tool call
- -> downstream execution
- -> tool message
- -> assistant continuation
-```
-
-The bridge must preserve ordering and IDs exactly.
-
-## 5.7 Retry safety
-
-Never regenerate a request in a way that can produce a second logically identical tool call after the first tool call has already been surfaced.
-
----
-
-# Phase 6 — Context and long-running trajectories
+# 15. Phase 11 — Observability and diagnostics
 
 **Priority: P1**
 
-## 6.1 Make context budget real
+The existing observability implementation should be kept, but production activation must be reconciled with the documentation.
 
-Wire configured context limits into the actual request path.
-
-Do not keep dead configuration values.
-
-## 6.2 Preserve critical messages
-
-Compaction should preserve:
-
-1. system/developer instructions
-2. current user task
-3. active tool call/result state
-4. recent assistant/tool trajectory
-5. required repository/task context
-
-## 6.3 Never invent workspace state
-
-The bridge must not claim it inspected files.
-
-Workspace state comes from agent tools.
-
-## 6.4 Context stress tests
-
-Test trajectories of:
-
-```text
-10 turns
-20 turns
-50 turns
-100 turns
-large tool outputs
-large file contents
-repeated edits
-```
-
-Measure prompt size, latency, failure rate, and compaction correctness.
-
----
-
-# Phase 7 — Observability and diagnostics
-
-**Priority: P1**
-
-Implement structured request lifecycle events:
+Safe lifecycle events should include at least:
 
 ```text
 request_received
-request_validated
-backend_started
-backend_retry
-backend_auth_failure
-first_token
-tool_call_detected
-stream_error
+context_built
+prompt_built
+upstream_request
+upstream_response
+candidate_tool_call
+parsed_tool_call
+schema_validation
+repair_attempt
+client_tool_call_returned
+observation_received
+observation_validated
+next_turn
 request_completed
-request_cancelled
+request_failed
 ```
 
 Each request gets a non-secret trace ID.
 
-Never log request bodies or credentials by default.
+Never log:
 
-Metrics should include:
+- prompts
+- model responses
+- tool arguments
+- cookies
+- API keys
+- authorization headers
+- session tokens
 
-- request count
-- success/failure
-- latency
-- time-to-first-token
-- upstream retries
-- auth failures
-- rate limits
-- cancellations
-- stream failures
-- tool-call parse failures
+unless a future explicitly opt-in secure diagnostic mode is designed and reviewed.
 
-### Exit criteria
+## Production activation decision
 
-A single failed agent request can be diagnosed from logs without exposing its prompt, cookies, or credentials.
+Choose one of:
+
+1. install Phase 10 by default after performance/security validation, or
+2. keep it opt-in and clearly document that behavior.
+
+Do not leave the repository ambiguous.
+
+### Exit gate
+
+A failed request can be diagnosed using event metadata without exposing credentials or content.
 
 ---
 
-# Phase 8 — Packaging and deployment
+# 16. Phase 12 — Legacy backend compatibility
 
 **Priority: P1**
 
-## 8.1 Package identity
+Legacy is deprecated, but must remain internally coherent until removal is intentional.
 
-Primary:
+Audit:
 
-```text
-gemini-agent-bridge
+- startup requirements
+- model mapping
+- files
+- streaming
+- tool calls
+- errors
+- authentication
+- shutdown
+
+The legacy backend must not accidentally become the default modern production path.
+
+If removed later, document the exact breaking changes.
+
+### Exit gate
+
+Legacy behavior is either tested/deprecated or explicitly removed; there is no accidental half-supported state.
+
+---
+
+# 17. Phase 13 — Packaging, launcher, and compatibility
+
+**Priority: P1**
+
+## Entrypoints
+
+Document the supported commands:
+
+```bash
+python -m gemini_web2api
 ```
 
-Preferred CLI:
+and the preferred installed CLI once finalized.
 
-```text
-gemini-agent-bridge
-```
+If `gemini_web2api.py` remains as a compatibility wrapper, explicitly test that it launches the same supported application.
 
-Compatibility CLI:
+## Clean installation
 
-```text
-gemini-web2api
-```
-
-## 8.2 Python support
-
-CI/test:
-
-```text
-3.11
-3.12
-3.13
-3.14
-```
-
-## 8.3 Clean installation
-
-Verify from a clean environment:
+Test from a clean virtual environment:
 
 ```bash
 python -m venv .venv
 pip install .
-gemini-agent-bridge --help
+python -m gemini_web2api --help
 ```
 
-No repository checkout assumptions.
+## Python matrix
 
-## 8.4 Docker
+Test supported Python versions explicitly rather than assuming local Python compatibility.
 
-Docker must:
-
-- install the modern dependency set
-- launch the modern backend
-- use safe configuration
-- avoid embedding secrets
-- expose the intended port
-- support graceful SIGTERM
-- provide health checks
-
-## 8.5 Compose
-
-Rename primary service/container branding to GeminiAgentBridge while retaining compatibility aliases only where useful.
-
----
-
-# Phase 9 — Extension/session sync
-
-**Priority: P1**
-
-Audit the extension independently.
+## Docker
 
 Verify:
 
-- Manifest validity
-- least-privilege permissions
-- correct Gemini host permissions
-- cookie access limited to required domains/names
-- export format exactly matches `modern.py`
-- no session values logged
-- no session values displayed unnecessarily
-- download behavior works
-- branding is GeminiAgentBridge
+- modern backend dependency set
+- safe bind/auth configuration
+- no embedded credentials
+- health check
+- graceful SIGTERM
+- intended port
 
-The extension must never become a second source of truth for authentication logic.
+### Exit gate
+
+A clean checkout behaves the same way as the development checkout for all documented commands.
 
 ---
 
-# Phase 10 — Legacy isolation
+# 18. Phase 14 — Cookie/session extension audit
 
 **Priority: P1**
 
-Keep legacy code available only when explicitly selected.
+Audit the browser extension independently from the server.
 
-Requirements:
+Verify:
 
-```text
-upstream_backend = modern    # default
-upstream_backend = legacy    # explicit compatibility/debug only
-```
+- manifest permissions are minimal
+- Gemini/Google host permissions are intentional
+- cookie selection is deterministic
+- exported fields match the modern backend contract
+- no credentials are logged or unnecessarily displayed
+- export file is clearly marked sensitive
+- server documentation matches extension output
+- stale/unused legacy fields are not required by the modern path
 
-Legacy code must:
+Do not make authentication fixes by weakening browser security.
 
-- be clearly labeled
-- have separate tests
-- not be imported into modern execution paths unnecessarily
-- not be used by Docker/default CLI
-- be documented as deprecated
+### Exit gate
 
-Cloudflare worker belongs here unless it is deliberately revived later.
-
----
-
-# Phase 11 — Remove import-time monkey patching
-
-**Priority: P1**
-
-Replace:
-
-```text
-_tools.messages_to_prompt = ...
-_tools.parse_tool_calls = ...
-_gemini.generate = ...
-```
-
-with explicit protocol/backend composition.
-
-Target dependency flow:
-
-```text
-server
-  -> protocol
-      -> backend
-```
-
-No hidden global mutation during import.
-
-This should be done only after the current behavior is protected by tests.
+The extension and modern backend have one documented session contract.
 
 ---
 
-# Phase 12 — Real agent validation
+# 19. Phase 15 — Test architecture upgrade
+
+**Priority: P0/P1**
+
+The existing suite is strong for pure logic and currently passes:
+
+```text
+167 passed, 5 subtests passed
+```
+
+But that does not prove live Gemini Web behavior.
+
+Build four test layers.
+
+## Layer A — Pure unit tests
+
+Fast deterministic tests for:
+
+- parsing
+- schemas
+- model resolution
+- protocol normalization
+- security
+- SSRF
+- compaction
+- retry classification
+
+## Layer B — Backend contract tests
+
+Mock the Gemini Web client and verify every internal request field reaches the adapter correctly.
+
+Especially:
+
+```text
+model
+files
+images
+thinking
+temporary
+tools
+tool_choice
+stream
+```
+
+## Layer C — HTTP integration tests
+
+Run the actual bridge HTTP server and test:
+
+- Chat Completions
+- Responses
+- `/v1/models`
+- SSE
+- errors
+- auth
+- cancellation
+
+## Layer D — Live Gemini Web tests
+
+Use the authenticated local environment without exposing session material.
+
+Required live scenarios:
+
+1. basic text
+2. sequential requests
+3. streaming
+4. image/file input
+5. model selection
+6. tool call
+7. multiple tool calls
+8. tool-result continuation
+9. malformed tool-call recovery
+10. long agentic task
+11. failure/recovery
+12. Hermes/OpenCode integration
+
+Live results must be recorded as evidence, not assumed from unit tests.
+
+---
+
+# 20. Phase 16 — Real agent compatibility matrix
 
 **Priority: P0 release gate**
 
-This is the most important test phase after code hardening.
+Test actual clients, not only curl.
 
-Use a fresh authenticated Gemini Web session.
+| Client | Basic | Tools | Multi-tool | Streaming | Long task | Tool results | Status |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Hermes | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | pending |
+| OpenCode | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | pending |
+| Codex-style client | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | pending |
+| Generic OpenAI SDK | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | pending |
 
-## OpenCode
+The previous Hermes failure must become a mandatory regression test:
 
-Test:
+```text
+Gemini emits malformed tool call
+ -> bridge recovers once
+ -> valid tool call returned
+ -> agent executes it
+ -> observation returned
+ -> next assistant turn succeeds
+```
 
-1. inspect repository
-2. explain architecture
-3. modify one file
-4. add a feature
-5. run tests
-6. diagnose failing test
-7. modify multiple files
-8. git diff review
-9. long tool trajectory
-10. cancellation/retry
+Also test the failure case:
 
-## Hermes
-
-Repeat the equivalent trajectory matrix.
-
-## Third agent
-
-Use another OpenAI-compatible coding agent to ensure the implementation isn't accidentally tailored to one client.
-
-### Required evidence
-
-Record:
-
-- exact bridge version/commit
-- backend version
-- client version
-- model mapping
-- number of requests
-- number of tool calls
-- stream failures
-- retries
-- latency
-- final task success
-
-Never record credentials.
+```text
+Gemini malformed call
+ -> repair malformed again
+ -> bounded failure
+ -> agent receives explicit provider error
+ -> no infinite loop
+```
 
 ---
 
-# Phase 13 — Reliability/stress testing
+# 21. Phase 17 — Performance and stability
 
 **Priority: P1**
 
-## Sequential load
+Measure before optimizing.
 
-Run:
+Metrics:
 
-```text
-10 requests
-50 requests
-100 requests
-```
+- request latency
+- time to first token
+- stream duration
+- prompt construction time
+- model resolution time
+- repair frequency
+- retry frequency
+- memory usage
+- concurrent request behavior
+- context-compaction cost
 
-and measure:
+The current single-client/async-lock design should remain until concurrency tests prove a safer higher-throughput model.
 
-- memory
-- open sockets
-- latency
-- error rate
-- session stability
-
-## Concurrent load
-
-Test 2/4/8/16 simultaneous requests.
-
-The expected behavior must be deterministic even if concurrency is deliberately serialized initially.
-
-## Fault injection
-
-Simulate:
-
-- expired session
-- network timeout
-- 429
-- 500
-- malformed upstream chunk
-- connection reset
-- client disconnect
-- shutdown during generation
-
-No request should leave the bridge in a corrupted state.
+Do not trade correctness for speculative throughput.
 
 ---
 
-# Phase 14 — Documentation and branding
+# 22. Phase 18 — Documentation truth audit
 
 **Priority: P1**
 
-Update all primary documentation to consistently say:
+Every document must distinguish:
 
 ```text
-GeminiAgentBridge
+implemented
+implemented but opt-in
+experimental
+deprecated
+planned
+live-verified
+not live-verified
 ```
 
-Search globally for:
+Audit:
 
-```text
-gemini-web2api
-Sophomoresty
-Forked from
-old repository URLs
-StreamGenerate
-```
+- README
+- architecture
+- API compatibility
+- clients
+- configuration
+- deployment
+- live transport
+- release status
+- phase status documents
+- extension documentation
 
-Classify each occurrence as:
+Remove claims that a phase is production-active when only its code/tests exist.
 
-1. compatibility
-2. legacy
-3. historical
-4. accidental
+### Exit gate
 
-Remove only category 4.
-
-Primary README must explain:
-
-- what GeminiAgentBridge is
-- what it is not
-- modern transport
-- legacy transport
-- security model
-- authentication/session setup without publishing credentials
-- OpenAI compatibility scope
-- tool-calling behavior
-- known limitations
-- real-agent validation status
+Documentation and runtime behavior agree.
 
 ---
 
-# Phase 15 — CI/release gates
+# 23. Implementation order
 
-**Priority: P1**
+Do **not** implement phases in numerical order if a lower phase depends on a higher-risk capability correction.
 
-Every PR must run:
-
-```text
-pytest
-compileall
-package build
-installation test
-Python 3.11–3.14 matrix
-credential scan
-Docker build
-```
-
-Optional protected live workflow:
+Recommended order:
 
 ```text
-fresh authenticated session
-modern backend smoke test
-stream smoke test
+A. Freeze baseline
+       ↓
+B. Backend capability inventory
+       ↓
+C. Backend interface
+       ↓
+D. Fix files/images
+       ↓
+E. Fix model resolution
+       ↓
+F. Preserve thinking/options
+       ↓
+G. Tool parser + bounded recovery
+       ↓
+H. Schema semantic preservation
+       ↓
+I. Streaming/SSE
+       ↓
+J. Context management
+       ↓
+K. Retry/cancellation/session health
+       ↓
+L. Observability activation decision
+       ↓
+M. Packaging/extension/docs
+       ↓
+N. Full unit + integration suite
+       ↓
+O. Live Gemini tests
+       ↓
+P. Hermes/OpenCode/Codex matrix
+       ↓
+Q. Release gate
 ```
 
-Live tests must never print secrets.
+This order intentionally puts **capability preservation before additional agent features**.
 
 ---
 
-# Final release checklist
+# 24. Definition of done
 
-## Repository
+GeminiAgentBridge is not release-ready until all of these are true:
 
-- [ ] modern implementation is on `main`
-- [ ] old implementation cannot accidentally become default
-- [ ] branding is correct
-- [ ] compatibility aliases documented
+### Architecture
 
-## Security
+- [ ] HTTP layer is backend-independent.
+- [ ] Modern backend is primary.
+- [ ] Legacy backend is explicitly deprecated/isolated.
+- [ ] Capability registry exists.
+- [ ] No important request field disappears silently.
 
-- [ ] loopback default
-- [ ] remote authentication mandatory
-- [ ] SSRF blocked
-- [ ] request size bounded
-- [ ] image size bounded
-- [ ] secret logs eliminated
-- [ ] raw upstream errors redacted
+### Gemini Web transport
 
-## Transport
+- [ ] Current maintained client API is used correctly.
+- [ ] Model resolution is deterministic.
+- [ ] Images/files are preserved.
+- [ ] Thinking/options are preserved or explicitly rejected.
+- [ ] Streaming works.
+- [ ] Client lifecycle is safe.
+- [ ] Cancellation works.
 
-- [ ] authenticated generation works
-- [ ] authenticated streaming works
-- [ ] client lifecycle is clean
-- [ ] concurrency is deterministic
-- [ ] cancellation works
-- [ ] recovery works
-- [ ] retry policy is agent-safe
+### Tool protocol
 
-## Protocol
+- [ ] Malformed JSON is handled.
+- [ ] Nested raw JSON parsing is robust.
+- [ ] Tool schemas are enforced.
+- [ ] Tool choice semantics are enforced.
+- [ ] Multiple tool calls preserve order/IDs.
+- [ ] Repair is bounded.
+- [ ] Retry cannot duplicate tool execution.
 
-- [ ] Chat Completions compatibility tested
-- [ ] Responses subset tested
-- [ ] SSE tested
-- [ ] finish reasons correct
-- [ ] tool calls correct
-- [ ] tool results correct
-- [ ] multi-tool trajectories correct
+### Context
 
-## Agents
+- [ ] Long trajectories have explicit budgets.
+- [ ] Critical state survives compaction.
+- [ ] Tool outputs are handled predictably.
+- [ ] No workspace state is fabricated.
 
-- [ ] OpenCode real-client gate passed
-- [ ] Hermes real-client gate passed
-- [ ] third OpenAI-compatible agent passed
-- [ ] long trajectory passed
-- [ ] cancellation passed
-- [ ] recovery passed
+### API
 
-## Packaging
+- [ ] Chat Completions compatibility matrix passes.
+- [ ] Responses subset is documented/tested.
+- [ ] `/v1/models` matches actual capabilities.
+- [ ] SSE failure semantics are deterministic.
 
-- [ ] clean pip install
-- [ ] CLI works
-- [ ] compatibility CLI works
-- [ ] Docker works
-- [ ] Compose works
-- [ ] CI green
+### Security
 
-## Documentation
+- [ ] Loopback default.
+- [ ] Remote authentication required.
+- [ ] SSRF protection tested.
+- [ ] Request/image limits tested.
+- [ ] Secret-safe logging verified.
+- [ ] Client errors do not leak credentials or internal secrets.
 
-- [ ] README current
-- [ ] architecture current
-- [ ] security current
-- [ ] live-transport status honest
-- [ ] known limitations explicit
+### Testing
+
+- [ ] Unit suite passes.
+- [ ] Backend contract suite passes.
+- [ ] HTTP integration suite passes.
+- [ ] Live Gemini smoke tests pass.
+- [ ] Hermes passes.
+- [ ] OpenCode passes.
+- [ ] Generic OpenAI client passes.
+- [ ] Long agentic task passes.
+- [ ] Malformed-tool-call regression passes.
+
+### Documentation
+
+- [ ] Runtime activation status is truthful.
+- [ ] Model capability claims are truthful.
+- [ ] Compatibility limitations are explicit.
+- [ ] Clean-install instructions work.
 
 ---
 
-# Implementation order
+# 25. Release gate
 
-Do not fix files randomly. Use this order:
+A release candidate must satisfy:
 
 ```text
-P0. Repository/release-line stabilization
+1. Clean repository
         ↓
-P0. Security hardening
+2. Full automated suite green
         ↓
-P0. Modern backend lifecycle/concurrency
+3. Backend contract suite green
         ↓
-P0. SSE lifecycle + cancellation
+4. HTTP/SSE integration green
         ↓
-P0. Tool-call retry safety
+5. Live Gemini Web smoke test green
         ↓
-P1. OpenAI protocol normalization
+6. Multimodal live test green
         ↓
-P1. Context management
+7. Tool recovery live test green
         ↓
-P1. Observability
+8. Hermes real repository task green
         ↓
-P1. Packaging/Docker/extension
+9. OpenCode real repository task green
         ↓
-P1. Remove monkey patches
+10. No capability-loss findings open
         ↓
-P0. Fresh authenticated live transport test
+11. Security/documentation audit green
         ↓
-P0. OpenCode + Hermes + third-agent tests
-        ↓
-P1. Stress/fault injection
-        ↓
-Release
+12. Release candidate
 ```
 
-## Rule for every fix
+A green unit suite alone is **not** a release gate.
 
-For each change:
+---
 
-1. Add or update a regression test first when practical.
-2. Make the smallest architectural change that fixes the root cause.
-3. Run focused tests.
-4. Run the full offline suite.
-5. Run security/credential scans.
-6. Only then move to the next phase.
-7. Never claim live Gemini functionality until the live gate passes with a fresh authenticated session.
+# 26. Current next action
+
+**Do not start Hermes again yet.**
+
+First implement the capability-preservation foundation:
+
+```text
+1. Inventory every request field in original server.py/gemini.py/tools.py.
+2. Inventory every field currently accepted by GeminiAgentBridge.
+3. Inventory what the maintained Gemini Web client actually accepts.
+4. Build the backend capability matrix.
+5. Create the internal backend request contract.
+6. Fix file/image forwarding.
+7. Fix model resolution.
+8. Fix thinking/extra-option forwarding.
+9. Add contract tests for all of the above.
+10. Re-run the full suite.
+```
+
+Only after these are complete should we return to the original real-world failure:
+
+```text
+Gemini malformed tool call
+        ↓
+GeminiAgentBridge recovery
+        ↓
+Hermes/OpenCode
+        ↓
+real repository coding task
+```
+
+That sequence gives us evidence that we fixed the underlying bridge architecture rather than merely masking one HTTP 500.
