@@ -2,6 +2,23 @@ import json
 import unittest
 
 from gemini_web2api.response_semantics import remove_fabricated_usage, sanitize_sse_event
+from gemini_web2api.runtime_observability import _SSEWriteProxy
+
+
+class _Sink:
+    def __init__(self):
+        self.data = bytearray()
+
+    def write(self, data):
+        self.data.extend(data)
+        return len(data)
+
+    def flush(self):
+        return None
+
+
+class _Handler:
+    _bridge_stream_failed = False
 
 
 class ResponseSemanticsTests(unittest.TestCase):
@@ -35,6 +52,15 @@ class ResponseSemanticsTests(unittest.TestCase):
         output = sanitize_sse_event(b": heartbeat\n\ndata: [DONE]\n\n").decode()
         self.assertIn(": heartbeat", output)
         self.assertIn("data: [DONE]", output)
+
+    def test_failed_stream_never_writes_done_marker(self):
+        sink = _Sink()
+        handler = _Handler()
+        handler._bridge_stream_failed = True
+        proxy = _SSEWriteProxy(sink, handler)
+        proxy.write(b"data: [DONE]\n\n")
+        proxy.flush()
+        self.assertNotIn(b"[DONE]", bytes(sink.data))
 
 
 if __name__ == "__main__":
