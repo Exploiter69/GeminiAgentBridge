@@ -24,15 +24,9 @@ class ModernBackendUnavailable(RuntimeError):
 
 
 class _ModernBackend:
-    """Own one GeminiClient on one asyncio loop and serialize backend calls."""
-
     capabilities = {
-        "files": True,
-        "streaming": True,
-        "dynamic_models": True,
-        "thoughts": True,
-        "temporary": True,
-        "provider_options": False,
+        "files": True, "streaming": True, "dynamic_models": True,
+        "thoughts": True, "temporary": True, "provider_options": False,
     }
 
     def __init__(self) -> None:
@@ -49,7 +43,6 @@ class _ModernBackend:
         with self._lock:
             if self._thread and self._thread.is_alive() and self._loop and not self._loop.is_closed():
                 return
-
             def runner() -> None:
                 self._loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self._loop)
@@ -62,7 +55,6 @@ class _ModernBackend:
                 if pending:
                     self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                 self._loop.close()
-
             self._started.clear()
             self._thread = threading.Thread(target=runner, name="gemini-webapi-loop", daemon=True)
             self._thread.start()
@@ -112,10 +104,7 @@ class _ModernBackend:
                 if "=" in item:
                     key, value = item.split("=", 1)
                     pairs[key.strip()] = value.strip()
-            return (
-                direct_psid or pairs.get("__Secure-1PSID", ""),
-                direct_psidts or pairs.get("__Secure-1PSIDTS", ""),
-            )
+            return direct_psid or pairs.get("__Secure-1PSID", ""), direct_psidts or pairs.get("__Secure-1PSIDTS", "")
         except Exception as exc:
             raise RuntimeError("unable to read Gemini authentication cookie") from exc
 
@@ -130,22 +119,14 @@ class _ModernBackend:
 
     async def _ensure_client(self):
         if GeminiClient is None:
-            raise ModernBackendUnavailable(
-                "gemini-webapi is not installed; run: pip install -r requirements.txt"
-            )
+            raise ModernBackendUnavailable("gemini-webapi is not installed; run: pip install -r requirements.txt")
         if self._client is not None:
             return self._client
-
         psid, psidts = self._cookie_values()
         if not psid:
             raise RuntimeError("Gemini Web authentication cookie is not configured")
-
         client = GeminiClient(psid, psidts, proxy=CONFIG.get("proxy") or None)
-        await client.init(
-            timeout=max(30, int(CONFIG.get("request_timeout_sec", 180))),
-            auto_close=False,
-            auto_refresh=True,
-        )
+        await client.init(timeout=max(30, int(CONFIG.get("request_timeout_sec", 180))), auto_close=False, auto_refresh=True)
         self._client = client
         return client
 
@@ -157,18 +138,23 @@ class _ModernBackend:
                 return resolver(requested)
             except Exception as exc:
                 raise BackendCapabilityError(f"requested model is unavailable: {requested}") from exc
-        # Older compatible clients accept model names directly. Do not collapse
-        # distinct requested models into a hard-coded flash/pro mapping.
         return requested
 
     @staticmethod
-    def _materialize_files(files: tuple[BackendFile, ...]):
+    def _materialize_files(files: tuple) -> list[str]:
         temp_paths: list[str] = []
         for item in files:
-            suffix = Path(item.filename).suffix or ".bin"
+            data = getattr(item, "data", None)
+            filename = getattr(item, "filename", None)
+            if data is None:
+                if isinstance(item, (str, os.PathLike)) and os.path.exists(item):
+                    temp_paths.append(os.fspath(item))
+                    continue
+                raise BackendCapabilityError("modern backend received a file without local bytes or a local path")
+            suffix = Path(filename or "attachment.bin").suffix or ".bin"
             handle = tempfile.NamedTemporaryFile(prefix="gemini-bridge-", suffix=suffix, delete=False)
             try:
-                handle.write(item.data)
+                handle.write(data)
                 handle.flush()
             finally:
                 handle.close()
@@ -176,8 +162,11 @@ class _ModernBackend:
         return temp_paths
 
     @staticmethod
-    def _cleanup_files(paths: list[str]) -> None:
+    def _cleanup_files(paths: list[str], original: tuple) -> None:
+        original_paths = {os.fspath(item) for item in original if isinstance(item, (str, os.PathLike)) and os.path.exists(item)}
         for path in paths:
+            if path in original_paths:
+                continue
             try:
                 os.unlink(path)
             except OSError:
@@ -185,24 +174,15 @@ class _ModernBackend:
 
     @staticmethod
     def _kwargs(client, request: BackendRequest, files: list[str]) -> dict:
-        kwargs = {
-            "model": _ModernBackend._resolve_model(client, request.model),
-            "temporary": request.temporary,
-        }
+        kwargs = {"model": _ModernBackend._resolve_model(client, request.model), "temporary": request.temporary}
         if files:
             kwargs["files"] = files
-        # The maintained web client exposes model-driven thoughts rather than
-        # the legacy integer think slot. A non-null legacy override cannot be
-        # represented faithfully, so fail explicitly instead of ignoring it.
         if request.think_mode not in (None, 0):
             raise BackendCapabilityError(
-                "modern Gemini Web transport does not expose a numeric think level; "
-                "select a model whose native thinking behavior matches the request"
+                "modern Gemini Web transport does not expose a numeric think level; select a thinking-capable model instead"
             )
         if request.provider_options:
-            raise BackendCapabilityError(
-                "provider-specific options are not supported by the modern Gemini Web client"
-            )
+            raise BackendCapabilityError("provider-specific options are not supported by the modern Gemini Web client")
         return kwargs
 
     async def _generate_once(self, request: BackendRequest) -> BackendResponse:
@@ -219,7 +199,7 @@ class _ModernBackend:
                 thoughts = getattr(response, "thoughts", None) or ""
                 return BackendResponse(text=text, thoughts=str(thoughts), raw=response)
             finally:
-                self._cleanup_files(paths)
+                self._cleanup_files(paths, request.files)
 
     async def _generate(self, request: BackendRequest) -> BackendResponse:
         attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
@@ -237,10 +217,7 @@ class _ModernBackend:
                     await self._close_client()
                 if attempt + 1 >= attempts:
                     break
-                delay = min(
-                    float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt),
-                    float(CONFIG.get("retry_max_delay_sec", 8)),
-                )
+                delay = min(float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt), float(CONFIG.get("retry_max_delay_sec", 8)))
                 await asyncio.sleep(delay)
         raise last_error
 
@@ -251,13 +228,10 @@ class _ModernBackend:
             client = await self._ensure_client()
             paths = self._materialize_files(request.files)
             try:
-                async for chunk in client.generate_content_stream(
-                    request.prompt, **self._kwargs(client, request, paths)
-                ):
+                async for chunk in client.generate_content_stream(request.prompt, **self._kwargs(client, request, paths)):
                     thoughts = getattr(chunk, "thoughts_delta", None)
                     if thoughts:
-                        state["thoughts"] = True
-                        state["thoughts_delta"] = thoughts
+                        state["thoughts_delta"] = str(thoughts)
                     delta = getattr(chunk, "text_delta", None)
                     if delta:
                         state["emitted"] = True
@@ -265,22 +239,20 @@ class _ModernBackend:
                 if not state["emitted"]:
                     raise RuntimeError("Gemini Web returned an empty stream")
             finally:
-                self._cleanup_files(paths)
+                self._cleanup_files(paths, request.files)
 
     @staticmethod
     def _is_session_error(exc: Exception) -> bool:
         text = f"{type(exc).__name__} {exc}".lower()
-        return any(token in text for token in (
-            "unauthenticated", "permission denied", "forbidden", "unauthorized",
-            "auth", "session expired", "invalid session", "model not found",
-        ))
+        return any(token in text for token in ("unauthenticated", "permission denied", "forbidden", "unauthorized", "auth", "session expired", "invalid session", "model not found"))
 
     def generate_response(self, request: BackendRequest) -> BackendResponse:
         return self._run(self._generate(request))
 
     def generate(self, prompt: str, model_id, **kwargs) -> str:
-        # Compatibility entrypoint retained for existing callers/tests.
-        model = kwargs.pop("model", model_id)
+        model = kwargs.pop("model", None)
+        if model is None:
+            model = {1: "gemini-flash", 2: "gemini-flash", 3: "gemini-pro", 4: "gemini-flash", 5: "gemini-flash", 6: "gemini-flash-lite"}.get(model_id, str(model_id))
         request = BackendRequest.from_legacy_args(prompt, str(model), **kwargs)
         return self.generate_response(request).text
 
@@ -297,10 +269,9 @@ class _ModernBackend:
     def generate_stream_response(self, request: BackendRequest):
         out: queue.Queue = queue.Queue()
         sentinel = object()
-        state = {"error": None, "emitted": False, "thoughts": False, "thoughts_delta": ""}
+        state = {"error": None, "emitted": False, "thoughts_delta": ""}
         self._ensure_loop()
         loop = self._loop
-
         async def producer():
             attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
             for attempt in range(attempts):
@@ -319,12 +290,8 @@ class _ModernBackend:
                         await self._close_client()
                     if state["emitted"] or attempt + 1 >= attempts:
                         break
-                    await asyncio.sleep(min(
-                        float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt),
-                        float(CONFIG.get("retry_max_delay_sec", 8)),
-                    ))
+                    await asyncio.sleep(min(float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt), float(CONFIG.get("retry_max_delay_sec", 8))))
             out.put(sentinel)
-
         future = asyncio.run_coroutine_threadsafe(producer(), loop)
         try:
             while True:
@@ -342,20 +309,19 @@ class _ModernBackend:
                 future.cancel()
 
     def generate_stream(self, prompt: str, model_id, **kwargs):
-        model = kwargs.pop("model", model_id)
+        model = kwargs.pop("model", None)
+        if model is None:
+            model = {1: "gemini-flash", 2: "gemini-flash", 3: "gemini-pro", 4: "gemini-flash", 5: "gemini-flash", 6: "gemini-flash-lite"}.get(model_id, str(model_id))
         request = BackendRequest.from_legacy_args(prompt, str(model), stream=True, **kwargs)
         yield from self.generate_stream_response(request)
 
     def shutdown(self) -> None:
         with self._lock:
-            loop = self._loop
-            thread = self._thread
+            loop, thread = self._loop, self._thread
             if not loop or not thread:
                 return
             if loop.is_closed() or not thread.is_alive():
-                self._loop = None
-                self._thread = None
-                self._client = None
+                self._loop = None; self._thread = None; self._client = None
                 return
             try:
                 close_future = asyncio.run_coroutine_threadsafe(self._close_client(), loop)
@@ -368,10 +334,7 @@ class _ModernBackend:
                 pass
             if thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=5)
-            self._loop = None
-            self._thread = None
-            self._client = None
-            self._async_lock = None
+            self._loop = None; self._thread = None; self._client = None; self._async_lock = None
 
 
 _BACKEND = _ModernBackend()
