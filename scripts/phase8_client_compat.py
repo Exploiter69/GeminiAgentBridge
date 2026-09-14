@@ -131,25 +131,25 @@ def _bridge(live: bool, cookie_file: str | None):
     return server, thread, patches
 
 
-def _hermes_env(root: Path, port: int) -> dict[str, str]:
+def _hermes_env(root: Path, port: int, model: str) -> dict[str, str]:
     home = root / "hermes-home"; home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(f"model:\n  default: {MODEL}\n  provider: custom\n  base_url: http://127.0.0.1:{port}/v1\n  api_key: phase8-test\nterminal:\n  backend: local\n  home_mode: profile\nagent:\n  max_turns: 8\n", encoding="utf-8")
+    (home / "config.yaml").write_text(f"model:\n  default: {model}\n  provider: custom\n  base_url: http://127.0.0.1:{port}/v1\n  api_key: phase8-test\nterminal:\n  backend: local\n  home_mode: profile\nagent:\n  max_turns: 12\n", encoding="utf-8")
     env = os.environ.copy(); env["HERMES_HOME"] = str(home); env.pop("OPENAI_API_KEY", None); env.pop("OPENAI_BASE_URL", None); return env
 
 
-def _opencode_config(workspace: Path, port: int) -> Path:
-    config = {"$schema": "https://opencode.ai/config.json", "model": f"phase8/{MODEL}", "provider": {"phase8": {"npm": "@ai-sdk/openai-compatible", "name": "Phase 8 Bridge Test", "options": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": "phase8-test"}, "models": {MODEL: {"name": MODEL, "limit": {"context": 128000, "output": 8192}}}}}}
+def _opencode_config(workspace: Path, port: int, model: str) -> Path:
+    config = {"$schema": "https://opencode.ai/config.json", "model": f"phase8/{model}", "provider": {"phase8": {"npm": "@ai-sdk/openai-compatible", "name": "Phase 8 Bridge Test", "options": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": "phase8-test"}, "models": {model: {"name": model, "limit": {"context": 128000, "output": 8192}}}}}}
     path = workspace / "opencode-phase8.json"; path.write_text(json.dumps(config, indent=2), encoding="utf-8"); return path
 
 
-def _run(name: str, prompt: str, workspace: Path, root: Path, port: int) -> dict:
+def _run(name: str, prompt: str, workspace: Path, root: Path, port: int, model: str) -> dict:
     if name == "hermes":
-        env = _hermes_env(root, port); cmd = ["hermes", "-z", prompt, "-m", MODEL, "-t", "file,terminal"]
+        env = _hermes_env(root, port, model); cmd = ["hermes", "-z", prompt, "-m", model, "-t", "file,terminal"]
     else:
         env = os.environ.copy(); env.pop("OPENAI_API_KEY", None); env.pop("OPENAI_BASE_URL", None)
-        env_home = root / "opencode-home"; env_home.mkdir(parents=True, exist_ok=True); env["HOME"] = str(env_home); env["XDG_CONFIG_HOME"] = str(env_home / ".config"); env["OPENCODE_CONFIG"] = str(_opencode_config(workspace, port))
-        cmd = ["opencode", "run", "--print-logs", "--log-level", "DEBUG", "--auto", "--model", f"phase8/{MODEL}", prompt]
-    proc = subprocess.run(cmd, cwd=workspace, env=env, text=True, capture_output=True, timeout=180)
+        env_home = root / "opencode-home"; env_home.mkdir(parents=True, exist_ok=True); env["HOME"] = str(env_home); env["XDG_CONFIG_HOME"] = str(env_home / ".config"); env["OPENCODE_CONFIG"] = str(_opencode_config(workspace, port, model))
+        cmd = ["opencode", "run", "--print-logs", "--log-level", "DEBUG", "--auto", "--model", f"phase8/{model}", prompt]
+    proc = subprocess.run(cmd, cwd=workspace, env=env, text=True, capture_output=True, timeout=300)
     output = (proc.stdout + "\n" + proc.stderr).strip(); marker = _marker(prompt)
     return {"returncode": proc.returncode, "passed": proc.returncode == 0 and marker in output, "marker": marker, "output_tail": output[-2500:]}
 
@@ -162,7 +162,7 @@ def _workspace(root: Path, case) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(); parser.add_argument("--hermes", action="store_true"); parser.add_argument("--opencode", action="store_true"); parser.add_argument("--live", action="store_true"); parser.add_argument("--cookie-file", type=str, default=None)
+    parser = argparse.ArgumentParser(); parser.add_argument("--hermes", action="store_true"); parser.add_argument("--opencode", action="store_true"); parser.add_argument("--live", action="store_true"); parser.add_argument("--cookie-file", type=str, default=None); parser.add_argument("--model", type=str, default=MODEL)
     args = parser.parse_args(); clients = [name for name, enabled in (("hermes", args.hermes), ("opencode", args.opencode)) if enabled]
     if not clients:
         print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "real_clients": "not requested", "self_check": True}, indent=2)); return 0
@@ -175,10 +175,10 @@ def main() -> int:
                 cases = {}; client_root = root / client; client_root.mkdir()
                 for case in COMPATIBILITY_MATRIX:
                     workspace = _workspace(client_root, case); prompt = f"{case.prompt} After actually completing the task, reply exactly PHASE8_{case.name.upper()}_OK."
-                    try: cases[case.name] = _run(client, prompt, workspace, root, port)
+                    try: cases[case.name] = _run(client, prompt, workspace, root, port, args.model)
                     except subprocess.TimeoutExpired: cases[case.name] = {"passed": False, "error": "client timed out"}
                 results[client] = {"cases": len(cases), "passed_cases": sum(1 for result in cases.values() if result.get("passed")), "all_pass": all(result.get("passed") for result in cases.values()), "details": cases}
-            print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "clients": results, "mode": "live" if args.live else "stub"}, indent=2)); return 0 if all(result.get("all_pass") for result in results.values()) else 1
+            print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "clients": results, "mode": "live" if args.live else "stub", "model": args.model}, indent=2)); return 0 if all(result.get("all_pass") for result in results.values()) else 1
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=5)
             for patcher in patches: patcher.stop()
