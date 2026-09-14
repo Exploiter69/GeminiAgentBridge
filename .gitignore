@@ -5,9 +5,13 @@ cookie.txt
 .env.*
 config.json
 config.local.json
+gemini-auth.json
+*.gemini-auth.json
 __pycache__/
 *.pyc
 .venv/
 venv/
 logs/
 *.log
+artifacts/phase13-release-candidate.json
+artifacts/phase13-release-candidate.sha256
