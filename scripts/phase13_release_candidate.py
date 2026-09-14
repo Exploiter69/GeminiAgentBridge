@@ -16,17 +16,21 @@ ARTIFACT_DIR = ROOT / "artifacts"
 EVIDENCE = ARTIFACT_DIR / "phase13-release-candidate.json"
 MANIFEST = ARTIFACT_DIR / "phase13-release-candidate.sha256"
 PHASE12_BASE = "d8305869cc5ab603afd5fa4b2d44b93483b1c811"
-CLIENT_EVIDENCE = ROOT / "docs/phase8-real-client-evidence.md"
+HISTORICAL_CLIENT_EVIDENCE = ROOT / "docs/phase8-real-client-evidence.md"
+FRESH_LIVE_EVIDENCE = ROOT / "docs/fresh-live-evidence.md"
 REQUIRED_FILES = (
-    "docs/FIXING_ROADMAP.md", "docs/CAPABILITY_MATRIX.md", "gemini_web2api/server.py", "gemini_web2api/modern.py",
-    "gemini_web2api/gemini.py", "gemini_web2api/models.py", "gemini_web2api/tools.py", "gemini_web2api/context.py",
-    "gemini_web2api/protocol.py", "gemini_web2api/backend.py", "gemini_web2api/observability.py",
-    "gemini_web2api/feature_porting.py", "gemini_web2api/performance.py", "tests/test_modern_transport.py",
-    "tests/test_modern_safety.py", "tests/test_roadmap_capabilities.py", "tests/test_extension_contract.py",
+    "docs/FIXING_ROADMAP.md", "docs/CAPABILITY_MATRIX.md", "docs/fresh-live-evidence.md",
+    "SECURITY.md", "gemini_web2api/server.py", "gemini_web2api/modern.py", "gemini_web2api/gemini.py",
+    "gemini_web2api/models.py", "gemini_web2api/tools.py", "gemini_web2api/context.py", "gemini_web2api/protocol.py",
+    "gemini_web2api/backend.py", "gemini_web2api/model_catalog.py", "gemini_web2api/response_semantics.py",
+    "gemini_web2api/observability.py", "gemini_web2api/runtime_observability.py", "gemini_web2api/feature_porting.py",
+    "gemini_web2api/performance.py", "tests/test_modern_transport.py", "tests/test_modern_safety.py",
+    "tests/test_backend_contract.py", "tests/test_model_catalog.py", "tests/test_response_semantics.py",
+    "tests/test_packaging_compat.py", "tests/test_roadmap_capabilities.py", "tests/test_extension_contract.py",
     "tests/test_phase8_compatibility.py", "tests/test_phase9_trajectory.py", "tests/test_phase10_observability.py",
     "tests/test_phase11_feature_porting.py", "tests/test_phase12_performance.py", "tests/test_phase13_release_candidate.py",
-    "scripts/phase8_client_compat.py", "scripts/phase9_trajectory_benchmark.py", "scripts/phase12_performance_benchmark.py",
-    "scripts/phase13_release_candidate.py", ".github/workflows/phase13-release-candidate.yml",
+    "scripts/live_gemini_web_test.py", "scripts/phase8_client_compat.py", "scripts/phase9_trajectory_benchmark.py",
+    "scripts/phase12_performance_benchmark.py", "scripts/phase13_release_candidate.py", ".github/workflows/phase13-release-candidate.yml",
     "docs/phase8-real-client-evidence.md", "docs/phase13-release-status.md",
 )
 PHASE_COMMITS = {
@@ -102,11 +106,19 @@ def main() -> int:
     except subprocess.CalledProcessError as exc:
         add("release_scope_contains_phase13_changes", False, str(exc))
 
-    client_text = CLIENT_EVIDENCE.read_text(encoding="utf-8") if CLIENT_EVIDENCE.is_file() else ""
-    client_ok = all(marker in client_text for marker in ("python scripts/phase8_client_compat.py --hermes --opencode", "Hermes: **13/13 cases passed**", "OpenCode: **13/13 cases passed**", "Combined: **26/26 cases passed**"))
-    add("real_client_evidence_recorded", client_ok, "durable Phase 8 local evidence contains the required 13/13 + 13/13 result" if client_ok else "required client evidence markers missing")
+    historical = HISTORICAL_CLIENT_EVIDENCE.read_text(encoding="utf-8") if HISTORICAL_CLIENT_EVIDENCE.is_file() else ""
+    historical_ok = all(marker in historical for marker in ("Hermes: **13/13 cases passed**", "OpenCode: **13/13 cases passed**", "Combined: **26/26 cases passed**"))
+    add("historical_client_evidence_recorded", historical_ok, "historical Phase 8 evidence is present" if historical_ok else "historical client evidence missing")
+
+    fresh = FRESH_LIVE_EVIDENCE.read_text(encoding="utf-8") if FRESH_LIVE_EVIDENCE.is_file() else ""
+    fresh_markers = ("Status: **PASS**", "LIVE_GEMINI_WEB_OK", "LIVE_GEMINI_WEB_STREAM_OK", "Hermes: **PASS**", "OpenCode: **PASS**")
+    add("fresh_authenticated_live_evidence", all(marker in fresh for marker in fresh_markers), "fresh authenticated Gemini Web + agent evidence recorded" if all(marker in fresh for marker in fresh_markers) else "fresh live evidence is not complete")
 
     for name, command in [
+        ("backend_contract_regression", [sys.executable, "-m", "unittest", "tests.test_backend_contract", "-v"]),
+        ("model_catalog_regression", [sys.executable, "-m", "unittest", "tests.test_model_catalog", "-v"]),
+        ("response_semantics_regression", [sys.executable, "-m", "unittest", "tests.test_response_semantics", "-v"]),
+        ("packaging_regression", [sys.executable, "-m", "unittest", "tests.test_packaging_compat", "-v"]),
         ("phase8_regression", [sys.executable, "-m", "unittest", "tests.test_phase8_compatibility", "-v"]),
         ("phase9_regression", [sys.executable, "-m", "unittest", "tests.test_phase9_trajectory", "-v"]),
         ("phase10_regression", [sys.executable, "-m", "unittest", "tests.test_phase10_observability", "-v"]),
