@@ -6,6 +6,7 @@ numeric mode/think slots, so those values remain isolated to that backend.
 """
 
 from .config import CONFIG
+from .backend_selection import effective_backend
 
 
 MODELS = {
@@ -65,17 +66,22 @@ def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
         if think_override < 0:
             return None, None, None, "think level must be non-negative", None
 
+    backend = effective_backend(
+        str(CONFIG.get("upstream_backend", "modern")).lower(),
+        CONFIG.get("cookie_file"),
+    )
+
     cfg = MODELS.get(requested)
     if not cfg:
         # Modern Gemini Web can resolve account-discovered model names directly.
         # Legacy mode cannot, so reject unknown names there rather than silently
         # routing them to an unrelated model.
-        if str(CONFIG.get("upstream_backend", "modern")).lower() != "legacy":
+        if backend != "legacy":
             return requested, requested, None, None, None
         return None, None, None, f"unknown model: {requested}", None
 
     mode_id = cfg["mode"]
-    if str(CONFIG.get("upstream_backend", "modern")).lower() == "legacy":
+    if backend == "legacy":
         think_mode = think_override if think_override is not None else cfg["think"]
         extra = cfg.get("extra")
     else:
@@ -89,5 +95,5 @@ def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
 
     # model_id is kept as the legacy numeric mode for compatibility. Modern
     # callers receive the actual requested model name in the same position.
-    resolved_id = mode_id if str(CONFIG.get("upstream_backend", "modern")).lower() == "legacy" else requested
+    resolved_id = mode_id if backend == "legacy" else requested
     return requested, resolved_id, think_mode, None, extra

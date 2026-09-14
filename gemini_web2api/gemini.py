@@ -20,13 +20,15 @@ except ImportError:
 from .backend import BackendFile, BackendRequest
 from .config import CONFIG
 from .performance import RetryPolicy
-from .modern import ModernBackendUnavailable, generate_response as modern_generate_response, generate_stream as modern_generate_stream
+from .backend_selection import effective_backend
+from .modern import generate_response as modern_generate_response, generate_stream as modern_generate_stream
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _cookie_lock = threading.Lock()
 _httpx_client = None
 _httpx_client_lock = threading.Lock()
+
 
 
 def log(msg: str):
@@ -302,7 +304,8 @@ def _generate_legacy(request: BackendRequest) -> str:
 
 def generate(prompt: str, model_id, think_mode=None, file_refs=None, extra_fields=None) -> str:
     """Generate while preserving every normalized request field."""
-    backend = str(CONFIG.get("upstream_backend", "modern")).lower()
+    configured_backend = str(CONFIG.get("upstream_backend", "modern")).lower()
+    backend = effective_backend(configured_backend, CONFIG.get("cookie_file"))
     request = BackendRequest.from_legacy_args(
         prompt,
         model_id,
@@ -315,18 +318,13 @@ def generate(prompt: str, model_id, think_mode=None, file_refs=None, extra_field
         return _generate_legacy(request)
     if backend == "modern":
         return modern_generate_response(request).text
-    if backend == "auto":
-        try:
-            return modern_generate_response(request).text
-        except ModernBackendUnavailable:
-            log("Modern Gemini transport is unavailable; explicit auto mode permits legacy fallback")
-            return _generate_legacy(request)
     raise ValueError(f"unsupported upstream_backend: {backend}")
 
 
 def generate_stream(prompt: str, model_id, think_mode=None, file_refs=None, extra_fields=None):
     """Stream while preserving files/model/temporary/options across transports."""
-    backend = str(CONFIG.get("upstream_backend", "modern")).lower()
+    configured_backend = str(CONFIG.get("upstream_backend", "modern")).lower()
+    backend = effective_backend(configured_backend, CONFIG.get("cookie_file"))
     request = BackendRequest.from_legacy_args(
         prompt,
         model_id,
@@ -342,14 +340,6 @@ def generate_stream(prompt: str, model_id, think_mode=None, file_refs=None, extr
     if backend == "modern":
         yield from modern_generate_stream(request)
         return
-    if backend == "auto":
-        try:
-            yield from modern_generate_stream(request)
-            return
-        except ModernBackendUnavailable:
-            log("Modern Gemini transport is unavailable; explicit auto mode permits legacy fallback")
-            yield from _legacy_stream(request)
-            return
     raise ValueError(f"unsupported upstream_backend: {backend}")
 
 
