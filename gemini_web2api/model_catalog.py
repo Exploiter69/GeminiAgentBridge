@@ -5,11 +5,20 @@ from typing import Any
 
 
 def model_name(model: Any) -> str:
-    return str(getattr(model, "name", None) or getattr(model, "id", None) or model)
+    return str(
+        getattr(model, "model_name", None)
+        or getattr(model, "name", None)
+        or getattr(model, "id", None)
+        or model
+    )
 
 
 def model_description(model: Any) -> str:
-    return str(getattr(model, "description", None) or getattr(model, "display_name", None) or "Account-discovered Gemini Web model")
+    return str(
+        getattr(model, "description", None)
+        or getattr(model, "display_name", None)
+        or "Account-discovered Gemini Web model"
+    )
 
 
 def openai_models(models: list[Any]) -> list[dict[str, Any]]:
@@ -29,7 +38,7 @@ def google_models(models: list[Any]) -> list[dict[str, Any]]:
     return [
         {
             "name": f"models/{model_name(model)}",
-            "displayName": model_name(model),
+            "displayName": str(getattr(model, "display_name", None) or model_name(model)),
             "description": model_description(model),
             "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
         }
