@@ -9,7 +9,7 @@ import time
 
 from .config import CONFIG
 from .model_catalog import google_models, openai_models
-from .modern import _BACKEND
+from . import modern
 from .observability import TRACE_HEADER, emit_event, new_trace_id
 from .response_semantics import remove_fabricated_usage, sanitize_sse_event
 
@@ -76,7 +76,11 @@ def _dynamic_models(self, path: str) -> bool:
     if not self._authorized():
         self.send_json({"error": {"message": "invalid api key"}}, 401)
         return True
-    models = _BACKEND.list_models()
+    try:
+        models = modern._BACKEND.list_models()
+    except Exception as exc:
+        self.send_json({"error": {"message": "model catalog unavailable", "type": type(exc).__name__}}, 503)
+        return True
     if path == "/v1/models":
         self.send_json({"object": "list", "data": openai_models(models)})
     else:
