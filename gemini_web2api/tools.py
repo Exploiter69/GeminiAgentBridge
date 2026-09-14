@@ -7,6 +7,7 @@ import binascii
 import io
 from urllib.parse import unquote_to_bytes
 
+from .config import CONFIG
 from .context import compact_messages
 from .grounding import GroundingFacts
 from .tool_schema import normalize_tool_definitions
@@ -96,8 +97,9 @@ def _image_from_part(part: dict):
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None, grounding: GroundingFacts | None = None, max_chars: int | None = None) -> tuple:
     tool_defs = normalize_tool_definitions(tools or []) if tools else []
     set_tool_context(tool_defs, tool_choice if tool_choice is not None else "auto")
-    if max_chars and max_chars > 0:
-        messages, _ = compact_messages(messages, max_chars)
+    budget = max_chars if max_chars is not None else int(CONFIG.get("prompt_soft_budget_chars", 0))
+    if budget > 0:
+        messages, _ = compact_messages(messages, budget)
 
     parts = []
     images = []
@@ -121,6 +123,8 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None, gro
         if isinstance(content, list):
             text_parts = []
             for c in content:
+                if not isinstance(c, dict):
+                    continue
                 if c.get("type") in ("text", "input_text"):
                     text_parts.append(c.get("text", ""))
                 else:
@@ -149,7 +153,6 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None, gro
 
 
 def parse_tool_calls(text: str) -> tuple:
-    """Extract and validate tool calls against the declarations for this request."""
     clean, calls = parse_tool_calls_robust(text)
     tool_defs, tool_choice = get_tool_context()
     errors = validate_tool_choice(tool_choice, tool_defs)
@@ -170,8 +173,7 @@ def build_tool_prompt(tool_defs: list) -> str:
     tool_spec = json.dumps(compact_defs, ensure_ascii=False, separators=(",", ":"))
     return (
         "# Tool Use\n\n"
-        "You can call the following tools to help accomplish tasks. "
-        "These tools connect to the user's local environment and will execute when called.\n\n"
+        "You can call the following tools to help accomplish tasks. These tools connect to the user's local environment and will execute when called.\n\n"
         "Call format (use this exact format):\n"
         "```function_call\n"
         '{"name": "<tool_name>", "args": {<arguments>}}\n'
@@ -248,10 +250,9 @@ def google_contents_to_prompt(req: dict) -> tuple:
 
 def parse_google_function_calls(text: str) -> tuple:
     function_calls = []
-    pattern1 = r'```function_call\s*\n(.*?)\n```'
-    pattern2 = r'(?:^|\n)function_call\s*\n(\{[^`]*?\})'
+    patterns = [r'```function_call\s*\n(.*?)\n```', r'(?:^|\n)function_call\s*\n(\{.*?\})']
     clean = text
-    for pattern in [pattern1, pattern2]:
+    for pattern in patterns:
         for match in re.findall(pattern, clean, re.DOTALL):
             try:
                 data = json.loads(match.strip())
@@ -259,7 +260,7 @@ def parse_google_function_calls(text: str) -> tuple:
                     function_calls.append({"name": data["name"], "args": data.get("args", data.get("arguments", {}))})
             except (json.JSONDecodeError, KeyError):
                 pass
-        clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
+        clean = re.sub(pattern, "", clean, flags=re.DOTALL).strip()
     if not function_calls and clean.strip().startswith("{"):
         try:
             data = json.loads(clean.strip())
