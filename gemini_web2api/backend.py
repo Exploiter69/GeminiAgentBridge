@@ -6,6 +6,7 @@ OpenAI/Google requests to a concrete Gemini Web transport.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Iterable
 
 
@@ -75,6 +76,41 @@ class BackendCapabilities:
         }
 
 
+class BackendHealthState(str, Enum):
+    """Lifecycle state reported by a backend without exposing credentials."""
+
+    STOPPED = "stopped"
+    STARTING = "starting"
+    READY = "ready"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class BackendHealth:
+    """Safe health snapshot for diagnostics/readiness checks."""
+
+    state: BackendHealthState
+    initialized: bool = False
+    authenticated: bool = False
+    model_catalog: bool = False
+    last_error: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.state == BackendHealthState.READY and self.initialized and self.authenticated
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state.value,
+            "initialized": self.initialized,
+            "authenticated": self.authenticated,
+            "model_catalog": self.model_catalog,
+            "ready": self.ready,
+            "last_error": self.last_error,
+        }
+
+
 @dataclass(frozen=True)
 class BackendResponse:
     """Normalized backend result while retaining provider metadata."""
@@ -90,11 +126,11 @@ class BackendCapabilityError(RuntimeError):
 
 
 class BackendProtocol:
-    """Small interface implemented by modern and legacy transports."""
+    """Interface implemented by modern and legacy transports."""
 
     capabilities: BackendCapabilities
 
-    def health(self) -> dict[str, Any]:
+    def health(self) -> BackendHealth:
         raise NotImplementedError
 
     def resolve_model(self, requested: str) -> Any:
