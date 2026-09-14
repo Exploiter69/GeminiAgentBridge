@@ -16,30 +16,13 @@ class RoadmapCapabilityTests(unittest.TestCase):
         self.assertEqual(args["content"], '{"x": 1}')
 
     def test_multiple_raw_tool_objects_preserve_order(self):
-        text = (
-            '{"name":"first","arguments":{"value":1}}\n'
-            '{"name":"second","arguments":{"value":2}}'
-        )
+        text = '{"name":"first","arguments":{"value":1}}\n{"name":"second","arguments":{"value":2}}'
         _, calls = protocol.parse_tool_calls_robust(text)
         self.assertEqual([c["function"]["name"] for c in calls], ["first", "second"])
 
     def test_schema_compaction_preserves_semantic_constraints(self):
-        original = [{
-            "type": "function",
-            "function": {
-                "name": "edit",
-                "description": "A very long description that can be shortened. " * 50,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "default": "README.md"},
-                        "mode": {"type": "string", "enum": ["safe", "fast"], "default": "safe"},
-                    },
-                    "required": ["path"],
-                    "additionalProperties": False,
-                },
-            },
-        }]
+        original = [{"type": "function", "function": {"name": "edit", "description": "A very long description that can be shortened. " * 50,
+            "parameters": {"type": "object", "properties": {"path": {"type": "string", "default": "README.md"}, "mode": {"type": "string", "enum": ["safe", "fast"], "default": "safe"}}, "required": ["path"], "additionalProperties": False}}}]
         compacted = normalize_tool_definitions(original, max_chars=500)
         params = compacted[0]["parameters"]
         self.assertEqual(params["required"], ["path"])
@@ -50,12 +33,12 @@ class RoadmapCapabilityTests(unittest.TestCase):
     def test_context_compaction_keeps_tool_call_and_result_together(self):
         messages = [
             {"role": "system", "content": "system contract"},
-            {"role": "user", "content": "old task"},
+            {"role": "user", "content": "old task " * 8},
             {"role": "assistant", "content": "call", "tool_calls": [{"id": "1"}]},
             {"role": "tool", "tool_call_id": "1", "content": "result"},
             {"role": "user", "content": "current task"},
         ]
-        compacted, meta = compact_messages(messages, 80)
+        compacted, meta = compact_messages(messages, 60)
         serialized = json.dumps(compacted)
         self.assertTrue(meta["compacted"])
         self.assertIn('"tool_call_id": "1"', serialized)
