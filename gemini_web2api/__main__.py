@@ -43,10 +43,11 @@ def main():
     if backend == "modern" and not CONFIG.get("cookie_file"):
         raise SystemExit("Gemini Web authentication cookie is required for the modern backend")
 
-    # Recovery owns GeminiHandler because HardenedGeminiHandler inherits its
-    # generation/parsing implementation. Observability wraps the final public
-    # handler and therefore covers both hardened and inherited paths.
+    # Recovery must be installed on the actual public handler because the
+    # hardened handler overrides the streaming/chat boundary. Keep the legacy
+    # base handler covered for compatibility as well.
     install_phase4_runtime(GeminiHandler)
+    install_phase4_runtime(HardenedGeminiHandler)
     install_observability(HardenedGeminiHandler)
 
     port = int(CONFIG["port"])

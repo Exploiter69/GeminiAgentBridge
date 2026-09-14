@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 from types import ModuleType
 
 from .config import CONFIG
@@ -147,9 +148,25 @@ def install_phase4_runtime(handler_cls) -> None:
         )
 
     def recover_error(exc: BaseException) -> RuntimeError:
+        # Preserve HTTPError so the HTTP boundary can retain upstream
+        # semantics such as 429 + Retry-After instead of turning them into
+        # an indistinguishable 502.
+        if isinstance(exc, urllib.error.HTTPError):
+            failure = classify_exception(exc)
+            module.log(
+                f"Phase5 upstream failure type={failure.error_type.value} "
+                f"retryable={failure.retryable} status={exc.code}"
+            )
+            raise exc
+
         failure = classify_exception(exc)
-        module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
-        return RuntimeError(f"upstream {failure.error_type.value}: {failure.message}")
+        module.log(
+            f"Phase5 upstream failure type={failure.error_type.value} "
+            f"retryable={failure.retryable}"
+        )
+        return RuntimeError(
+            f"upstream {failure.error_type.value}: {failure.message}"
+        )
 
     def recover_raw(raw):
         failure = classify_upstream_text(raw)

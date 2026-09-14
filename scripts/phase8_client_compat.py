@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -112,13 +113,14 @@ def _stub(prompt: str, *args, **kwargs) -> str:
     return "```tool_call\n" + json.dumps({"name": name, "arguments": _args(schema, prompt)}) + "\n```"
 
 
-def _bridge(live: bool, cookie_file: str | None):
+def _bridge(live: bool, cookie_file: str | None, backend: str):
     CONFIG["api_keys"] = []; CONFIG["log_requests"] = False
     install_phase4_runtime(GeminiHandler)
+    install_phase4_runtime(HardenedGeminiHandler)
     install_observability(HardenedGeminiHandler)
     if live:
         if not cookie_file or not os.path.isfile(cookie_file): raise RuntimeError("--live requires an existing --cookie-file")
-        CONFIG["upstream_backend"] = "modern"; CONFIG["cookie_file"] = cookie_file
+        CONFIG["upstream_backend"] = backend; CONFIG["cookie_file"] = cookie_file
         server = HardenedThreadedServer(("127.0.0.1", 0), HardenedGeminiHandler); patches = []
     else:
         server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
@@ -162,22 +164,65 @@ def _workspace(root: Path, case) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(); parser.add_argument("--hermes", action="store_true"); parser.add_argument("--opencode", action="store_true"); parser.add_argument("--live", action="store_true"); parser.add_argument("--cookie-file", type=str, default=None); parser.add_argument("--model", type=str, default=MODEL)
+    parser = argparse.ArgumentParser(); parser.add_argument("--hermes", action="store_true"); parser.add_argument("--opencode", action="store_true"); parser.add_argument("--live", action="store_true"); parser.add_argument("--cookie-file", type=str, default=None); parser.add_argument("--model", type=str, default=MODEL); parser.add_argument("--backend", choices=("legacy", "modern", "auto"), default="legacy"); parser.add_argument("--live-delay", type=float, default=2.0, help="Delay between live compatibility cases")
     args = parser.parse_args(); clients = [name for name, enabled in (("hermes", args.hermes), ("opencode", args.opencode)) if enabled]
     if not clients:
         print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "real_clients": "not requested", "self_check": True}, indent=2)); return 0
     original = dict(CONFIG)
     with tempfile.TemporaryDirectory(prefix="gemini-agent-bridge-phase8-") as td:
-        root = Path(td); server, thread, patches = _bridge(args.live, args.cookie_file); port = server.server_address[1]; results = {}
+        root = Path(td); server, thread, patches = _bridge(args.live, args.cookie_file, args.backend); port = server.server_address[1]; results = {}
         try:
             for client in clients:
                 if not shutil.which(client): results[client] = {"passed": False, "error": "client not installed"}; continue
                 cases = {}; client_root = root / client; client_root.mkdir()
-                for case in COMPATIBILITY_MATRIX:
+                infrastructure_error = None
+                for case_index, case in enumerate(COMPATIBILITY_MATRIX):
+                    if args.live and case_index:
+                        time.sleep(max(0.0, args.live_delay))
+
                     workspace = _workspace(client_root, case); prompt = f"{case.prompt} After actually completing the task, reply exactly PHASE8_{case.name.upper()}_OK."
-                    try: cases[case.name] = _run(client, prompt, workspace, root, port, args.model)
-                    except subprocess.TimeoutExpired: cases[case.name] = {"passed": False, "error": "client timed out"}
-                results[client] = {"cases": len(cases), "passed_cases": sum(1 for result in cases.values() if result.get("passed")), "all_pass": all(result.get("passed") for result in cases.values()), "details": cases}
+                    try:
+                        case_result = _run(client, prompt, workspace, root, port, args.model)
+                        cases[case.name] = case_result
+
+                        # A provider-side rate limit or transport outage is an
+                        # infrastructure condition, not a client compatibility
+                        # failure. Stop the live matrix rather than amplifying
+                        # the upstream failure with more requests.
+                        diagnostic = str(case_result).lower()
+                        if (
+                            "429" in diagnostic
+                            or "too many requests" in diagnostic
+                            or "rate_limit" in diagnostic
+                            or "rate limit" in diagnostic
+                            or "upstream request failed" in diagnostic
+                            or "ai_retryerror" in diagnostic
+                        ):
+                            infrastructure_error = "upstream rate-limit/transport failure"
+                            print(
+                                f"PHASE8_INFRASTRUCTURE_STOP: {client} "
+                                f"{case.name}: {infrastructure_error}",
+                                flush=True,
+                            )
+                            break
+
+                    except subprocess.TimeoutExpired:
+                        cases[case.name] = {"passed": False, "error": "client timed out"}
+
+                results[client] = {
+                    "cases": len(cases),
+                    "passed_cases": sum(
+                        1 for result in cases.values()
+                        if result.get("passed")
+                    ),
+                    "all_pass": (
+                        infrastructure_error is None
+                        and len(cases) == len(COMPATIBILITY_MATRIX)
+                        and all(result.get("passed") for result in cases.values())
+                    ),
+                    "infrastructure_error": infrastructure_error,
+                    "details": cases,
+                }
             print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "clients": results, "mode": "live" if args.live else "stub", "model": args.model}, indent=2)); return 0 if all(result.get("all_pass") for result in results.values()) else 1
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=5)

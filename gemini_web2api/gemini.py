@@ -233,8 +233,11 @@ def _retry_policy() -> RetryPolicy:
 
 
 def _is_retryable_error(error: Exception) -> bool:
+    # A provider rate limit is not a transient transport failure. Retrying
+    # immediately amplifies the rate limit and can make downstream agents
+    # retry the same request repeatedly. Preserve 429 for the API boundary.
     if isinstance(error, urllib.error.HTTPError):
-        return error.code in {408, 425, 429} or 500 <= error.code <= 599
+        return error.code in {408, 425} or 500 <= error.code <= 599
     if isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
         return True
     if HAS_HTTPX and isinstance(error, httpx.TransportError):

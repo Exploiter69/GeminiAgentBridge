@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import re
+import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -95,6 +96,58 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
+
+    @staticmethod
+    def _upstream_error_response(exc: Exception) -> tuple[int, dict, dict]:
+        """Map upstream failures to safe HTTP semantics.
+
+        Credentials, response bodies, and upstream payloads are never exposed.
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            status = int(exc.code)
+
+            if status == 429:
+                headers = {}
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                if retry_after:
+                    headers["Retry-After"] = retry_after
+                return (
+                    429,
+                    {"error": {
+                        "message": "upstream rate limit",
+                        "type": "rate_limit",
+                    }},
+                    headers,
+                )
+
+            if status in (401, 403):
+                return (
+                    status,
+                    {"error": {
+                        "message": "upstream authentication/session rejected",
+                        "type": "authentication_error",
+                    }},
+                    {},
+                )
+
+            if 500 <= status <= 599:
+                return (
+                    502,
+                    {"error": {
+                        "message": "upstream server error",
+                        "type": "upstream_error",
+                    }},
+                    {},
+                )
+
+        return (
+            502,
+            {"error": {
+                "message": "upstream request failed",
+                "type": "upstream_error",
+            }},
+            {},
+        )
 
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
@@ -234,7 +287,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            status, payload, headers = self._upstream_error_response(e)
+            body = json.dumps(payload, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         tool_calls = None
@@ -327,7 +389,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
             file_refs = _upload_images(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            status, payload, headers = self._upstream_error_response(e)
+            body = json.dumps(payload, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         tool_calls = None
