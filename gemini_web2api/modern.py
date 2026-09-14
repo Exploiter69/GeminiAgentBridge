@@ -10,7 +10,15 @@ import tempfile
 import threading
 from pathlib import Path
 
-from .backend import BackendCapabilityError, BackendFile, BackendRequest, BackendResponse
+from .backend import (
+    BackendCapabilities,
+    BackendCapabilityError,
+    BackendFile,
+    BackendHealth,
+    BackendHealthState,
+    BackendRequest,
+    BackendResponse,
+)
 from .config import CONFIG
 
 try:
@@ -24,10 +32,14 @@ class ModernBackendUnavailable(RuntimeError):
 
 
 class _ModernBackend:
-    capabilities = {
-        "files": True, "streaming": True, "dynamic_models": True,
-        "thoughts": True, "temporary": True, "provider_options": False,
-    }
+    capabilities = BackendCapabilities(
+        files=True,
+        streaming=True,
+        dynamic_models=True,
+        thoughts=True,
+        temporary=True,
+        provider_options=False,
+    )
 
     def __init__(self) -> None:
         self._loop = None
@@ -36,6 +48,26 @@ class _ModernBackend:
         self._lock = threading.Lock()
         self._async_lock = None
         self._started = threading.Event()
+        self._health_lock = threading.Lock()
+        self._health = BackendHealth(BackendHealthState.STOPPED)
+
+    def _set_health(self, state: BackendHealthState, *, initialized=None, authenticated=None,
+                    model_catalog=None, error=None) -> None:
+        with self._health_lock:
+            current = self._health
+            self._health = BackendHealth(
+                state=state,
+                initialized=current.initialized if initialized is None else initialized,
+                authenticated=current.authenticated if authenticated is None else authenticated,
+                model_catalog=current.model_catalog if model_catalog is None else model_catalog,
+                last_error=None if error is None and state == BackendHealthState.READY else (
+                    current.last_error if error is None else str(error)
+                ),
+            )
+
+    def health(self) -> BackendHealth:
+        with self._health_lock:
+            return self._health
 
     def _ensure_loop(self) -> None:
         if self._thread and self._thread.is_alive() and self._loop and not self._loop.is_closed():
@@ -43,6 +75,7 @@ class _ModernBackend:
         with self._lock:
             if self._thread and self._thread.is_alive() and self._loop and not self._loop.is_closed():
                 return
+            self._set_health(BackendHealthState.STARTING)
             def runner() -> None:
                 self._loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self._loop)
@@ -59,6 +92,8 @@ class _ModernBackend:
             self._thread = threading.Thread(target=runner, name="gemini-webapi-loop", daemon=True)
             self._thread.start()
             if not self._started.wait(5):
+                self._set_health(BackendHealthState.FAILED, initialized=False, authenticated=False,
+                                 error="modern Gemini transport event loop failed to start")
                 raise RuntimeError("modern Gemini transport event loop failed to start")
 
     def _run(self, coro, timeout=None):
@@ -66,6 +101,7 @@ class _ModernBackend:
         loop = self._loop
         if loop is None or loop.is_closed() or not self._thread or not self._thread.is_alive():
             coro.close()
+            self._set_health(BackendHealthState.FAILED, initialized=False, error="modern Gemini transport event loop is unavailable")
             raise RuntimeError("modern Gemini transport event loop is unavailable")
         timeout = timeout or max(30, int(CONFIG.get("request_timeout_sec", 180)) + 15)
         try:
@@ -77,6 +113,7 @@ class _ModernBackend:
             return future.result(timeout=timeout)
         except TimeoutError:
             future.cancel()
+            self._set_health(BackendHealthState.DEGRADED, error="modern Gemini transport request timed out")
             raise
         except BaseException:
             future.cancel()
@@ -116,18 +153,33 @@ class _ModernBackend:
                 await client.close()
             except Exception:
                 pass
+        self._set_health(BackendHealthState.STARTING, initialized=False, authenticated=False, model_catalog=False)
 
     async def _ensure_client(self):
         if GeminiClient is None:
+            self._set_health(BackendHealthState.FAILED, initialized=False, authenticated=False,
+                             error="gemini-webapi is not installed")
             raise ModernBackendUnavailable("gemini-webapi is not installed; run: pip install -r requirements.txt")
         if self._client is not None:
             return self._client
+        self._set_health(BackendHealthState.STARTING, initialized=False, authenticated=False)
         psid, psidts = self._cookie_values()
         if not psid:
+            self._set_health(BackendHealthState.FAILED, initialized=False, authenticated=False,
+                             error="Gemini Web authentication is not configured")
             raise RuntimeError("Gemini Web authentication cookie is not configured")
         client = GeminiClient(psid, psidts, proxy=CONFIG.get("proxy") or None)
-        await client.init(timeout=max(30, int(CONFIG.get("request_timeout_sec", 180))), auto_close=False, auto_refresh=True)
+        try:
+            await client.init(timeout=max(30, int(CONFIG.get("request_timeout_sec", 180))), auto_close=False, auto_refresh=True)
+        except Exception as exc:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            self._set_health(BackendHealthState.FAILED, initialized=False, authenticated=False, error=type(exc).__name__)
+            raise
         self._client = client
+        self._set_health(BackendHealthState.READY, initialized=True, authenticated=True)
         return client
 
     @staticmethod
@@ -139,6 +191,13 @@ class _ModernBackend:
             except Exception as exc:
                 raise BackendCapabilityError(f"requested model is unavailable: {requested}") from exc
         return requested
+
+    def resolve_model(self, requested: str):
+        self._ensure_loop()
+        async def resolve():
+            client = await self._ensure_client()
+            return self._resolve_model(client, requested)
+        return self._run(resolve())
 
     @staticmethod
     def _materialize_files(files: tuple) -> list[str]:
@@ -219,6 +278,7 @@ class _ModernBackend:
                     break
                 delay = min(float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt), float(CONFIG.get("retry_max_delay_sec", 8)))
                 await asyncio.sleep(delay)
+        self._set_health(BackendHealthState.DEGRADED, error=type(last_error).__name__ if last_error else "unknown error")
         raise last_error
 
     async def _stream_once(self, request: BackendRequest, out: queue.Queue, state: dict) -> None:
@@ -264,7 +324,9 @@ class _ModernBackend:
         models = getattr(client, "list_models", None)
         if not callable(models):
             raise ModernBackendUnavailable("installed gemini-webapi client cannot enumerate models")
-        return list(models() or [])
+        result = list(models() or [])
+        self._set_health(BackendHealthState.READY, model_catalog=True)
+        return result
 
     def generate_stream_response(self, request: BackendRequest):
         out: queue.Queue = queue.Queue()
@@ -291,6 +353,7 @@ class _ModernBackend:
                     if state["emitted"] or attempt + 1 >= attempts:
                         break
                     await asyncio.sleep(min(float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt), float(CONFIG.get("retry_max_delay_sec", 8))))
+            self._set_health(BackendHealthState.DEGRADED, error=type(state["error"]).__name__ if state["error"] else "stream failed")
             out.put(sentinel)
         future = asyncio.run_coroutine_threadsafe(producer(), loop)
         try:
@@ -319,9 +382,11 @@ class _ModernBackend:
         with self._lock:
             loop, thread = self._loop, self._thread
             if not loop or not thread:
+                self._set_health(BackendHealthState.STOPPED, initialized=False, authenticated=False, model_catalog=False)
                 return
             if loop.is_closed() or not thread.is_alive():
                 self._loop = None; self._thread = None; self._client = None
+                self._set_health(BackendHealthState.STOPPED, initialized=False, authenticated=False, model_catalog=False)
                 return
             try:
                 close_future = asyncio.run_coroutine_threadsafe(self._close_client(), loop)
@@ -335,6 +400,7 @@ class _ModernBackend:
             if thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=5)
             self._loop = None; self._thread = None; self._client = None; self._async_lock = None
+            self._set_health(BackendHealthState.STOPPED, initialized=False, authenticated=False, model_catalog=False)
 
 
 _BACKEND = _ModernBackend()
@@ -356,3 +422,11 @@ def generate_stream(request_or_prompt, model_id=None, **kwargs):
         yield from _BACKEND.generate_stream_response(request_or_prompt)
     else:
         yield from _BACKEND.generate_stream(request_or_prompt, model_id, **kwargs)
+
+
+def health() -> BackendHealth:
+    return _BACKEND.health()
+
+
+def shutdown() -> None:
+    _BACKEND.shutdown()
