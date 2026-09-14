@@ -11,12 +11,11 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# Allow direct execution as ``python scripts/phase12_performance_benchmark.py``
-# from a clean checkout, matching the CI invocation.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gemini_web2api.context import compact_messages
 from gemini_web2api.performance import RetryPolicy, benchmark_callable, stable_report
+from gemini_web2api.protocol import clear_tool_context, set_tool_context
 from gemini_web2api.tool_schema import normalize_tool_definitions
 from gemini_web2api.tools import build_tool_prompt, parse_tool_calls
 
@@ -57,44 +56,26 @@ def main() -> int:
     policy = RetryPolicy(attempts=5, base_delay_sec=1, backoff_multiplier=2, max_delay_sec=5)
     assert [policy.delay_for_retry(i) for i in range(5)] == [1, 2, 4, 5, 5]
 
-    _, context_sample = benchmark_callable(
-        "context_compaction",
-        lambda: compact_messages(messages, 5000),
-        iterations=30,
-    )
-    normalized, schema_sample = benchmark_callable(
-        "tool_schema_normalization",
-        lambda: normalize_tool_definitions(tools, max_chars=12000),
-        iterations=30,
-    )
-    _, prompt_sample = benchmark_callable(
-        "tool_prompt_build",
-        lambda: build_tool_prompt(tools),
-        iterations=30,
-    )
+    _, context_sample = benchmark_callable("context_compaction", lambda: compact_messages(messages, 5000), iterations=30)
+    normalized, schema_sample = benchmark_callable("tool_schema_normalization", lambda: normalize_tool_definitions(tools, max_chars=12000), iterations=30)
+    _, prompt_sample = benchmark_callable("tool_prompt_build", lambda: build_tool_prompt(tools), iterations=30)
 
-    text = "\n".join(
-        f'```tool_call\n{{"name":"tool_{i}","arguments":{{"path":"file_{i}.py"}}}}\n```'
-        for i in range(8)
-    )
-    _, parser_sample = benchmark_callable(
-        "tool_call_parser",
-        lambda: parse_tool_calls(text),
-        iterations=30,
-    )
+    text = "\n".join(f'```tool_call\n{{"name":"tool_{i}","arguments":{{"path":"file_{i}.py"}}}}\n```' for i in range(8))
+    tool_defs = normalize_tool_definitions(tools)
+    set_tool_context(tool_defs, "auto")
+    try:
+        _, parser_sample = benchmark_callable("tool_call_parser", lambda: parse_tool_calls(text), iterations=30)
+        parsed_text, parsed_calls = parse_tool_calls(text)
+    finally:
+        clear_tool_context()
 
     def concurrent_compaction() -> list[dict]:
         with ThreadPoolExecutor(max_workers=8) as executor:
             return list(executor.map(lambda _: compact_messages(messages, 5000)[1], range(16)))
 
-    concurrent_result, concurrent_sample = benchmark_callable(
-        "concurrent_compaction",
-        concurrent_compaction,
-        iterations=5,
-    )
+    concurrent_result, concurrent_sample = benchmark_callable("concurrent_compaction", concurrent_compaction, iterations=5)
 
     compacted, context_meta = compact_messages(messages, 5000)
-    parsed_text, parsed_calls = parse_tool_calls(text)
     expected_elided = context_meta["elided_messages"]
     assert context_meta["compacted"] is True
     assert "final task: verify target.py" in json.dumps(compacted)
