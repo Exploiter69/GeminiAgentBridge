@@ -16,3 +16,5 @@ logs/
 *.log
 artifacts/phase13-release-candidate.json
 artifacts/phase13-release-candidate.sha256
+artifacts/final-release-gate.json
+artifacts/wheels/
