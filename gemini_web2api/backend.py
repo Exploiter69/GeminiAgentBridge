@@ -1,8 +1,7 @@
 """Backend-neutral request/response contracts.
 
 The HTTP adapters must not silently drop provider capabilities while translating
-OpenAI/Google requests to a concrete Gemini Web transport.  This module is the
-single internal contract between the protocol layer and backends.
+OpenAI/Google requests to a concrete Gemini Web transport.
 """
 from __future__ import annotations
 
@@ -21,17 +20,12 @@ class BackendFile:
 
 @dataclass(frozen=True)
 class BackendRequest:
-    """Complete normalized generation request.
-
-    ``provider_options`` is deliberately opaque: fields understood by the
-    legacy StreamGenerate transport can travel through the modern-independent
-    layer without being silently discarded.
-    """
+    """Complete normalized generation request passed to a concrete backend."""
 
     prompt: str
-    model: str
+    model: str | int
     stream: bool = False
-    files: tuple[BackendFile, ...] = ()
+    files: tuple[BackendFile | str, ...] = ()
     think_mode: int | None = None
     temporary: bool = False
     provider_options: dict[str, Any] = field(default_factory=dict)
@@ -40,10 +34,10 @@ class BackendRequest:
     def from_legacy_args(
         cls,
         prompt: str,
-        model: str,
+        model: str | int,
         *,
         stream: bool = False,
-        files: Iterable[BackendFile] | None = None,
+        files: Iterable[BackendFile | str] | None = None,
         think_mode: int | None = None,
         temporary: bool = False,
         provider_options: dict[str, Any] | None = None,
@@ -70,6 +64,16 @@ class BackendCapabilities:
     temporary: bool
     provider_options: bool
 
+    def as_dict(self) -> dict[str, bool]:
+        return {
+            "files": self.files,
+            "streaming": self.streaming,
+            "dynamic_models": self.dynamic_models,
+            "thoughts": self.thoughts,
+            "temporary": self.temporary,
+            "provider_options": self.provider_options,
+        }
+
 
 @dataclass(frozen=True)
 class BackendResponse:
@@ -83,3 +87,24 @@ class BackendResponse:
 
 class BackendCapabilityError(RuntimeError):
     """Raised when a requested capability cannot be represented safely."""
+
+
+class BackendProtocol:
+    """Small interface implemented by modern and legacy transports."""
+
+    capabilities: BackendCapabilities
+
+    def health(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def resolve_model(self, requested: str) -> Any:
+        raise NotImplementedError
+
+    def generate_response(self, request: BackendRequest) -> BackendResponse:
+        raise NotImplementedError
+
+    def generate_stream_response(self, request: BackendRequest):
+        raise NotImplementedError
+
+    def shutdown(self) -> None:
+        raise NotImplementedError
