@@ -113,7 +113,7 @@ def main() -> int:
     fresh = FRESH_LIVE_EVIDENCE.read_text(encoding="utf-8") if FRESH_LIVE_EVIDENCE.is_file() else ""
     fresh_markers = ("Status: **PASS**", "LIVE_GEMINI_WEB_OK", "LIVE_GEMINI_WEB_STREAM_OK", "Hermes: **PASS**", "OpenCode: **PASS**")
     fresh_ok = all(marker in fresh for marker in fresh_markers)
-    add("fresh_authenticated_live_evidence", fresh_ok, "fresh authenticated Gemini Web + agent evidence recorded" if fresh_ok else "fresh live evidence is not complete")
+    add("real_client_evidence_recorded", fresh_ok, "fresh authenticated Gemini Web + agent evidence recorded" if fresh_ok else "fresh live evidence is not complete")
 
     for name, command in [
         ("backend_contract_regression", [sys.executable, "-m", "unittest", "tests.test_backend_contract", "-v"]),
