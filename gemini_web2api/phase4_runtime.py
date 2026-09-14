@@ -224,10 +224,15 @@ def install_phase4_runtime(handler_cls) -> None:
     def parse_calls(text: str):
         tool_defs, tool_choice = _current_tool_context()
         clean, calls = parse_tool_calls_robust(text)
-        errors = validate_tool_calls(calls, tool_defs)
+        errors = validate_tool_choice(tool_choice, tool_defs)
+        errors.extend(validate_tool_calls(calls, tool_defs))
         errors.extend(_choice_errors(calls, tool_defs, tool_choice))
         if errors:
-            return clean, calls
+            phase4_tools.clear_tool_context()
+            raise ValueError(
+                "invalid tool call protocol: " + "; ".join(errors[:8])
+            )
+        phase4_tools.clear_tool_context()
         return clean, calls
 
     handler_cls.send_json = send_json
