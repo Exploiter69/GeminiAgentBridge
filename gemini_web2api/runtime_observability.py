@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextvars
 import functools
+import json
 import sys
 import time
 
@@ -110,6 +111,17 @@ def install_observability(handler_cls) -> None:
         token = _CURRENT_HANDLER.set(self)
         try:
             result = original_do_post(self)
+            if self._bridge_stream_failed:
+                error_event = {
+                    "type": "error",
+                    "error": {
+                        "message": "upstream stream failed after response commitment",
+                        "code": "upstream_stream_error",
+                        "trace_id": trace_id,
+                    },
+                }
+                self.wfile.write(("event: error\ndata: " + json.dumps(error_event, separators=(",", ":")) + "\n\n").encode())
+                self.wfile.flush()
             emit_event(trace_id, "request_completed", method="POST", path=self.path, duration_ms=int((time.monotonic() - started) * 1000), stream_failed=bool(self._bridge_stream_failed))
             return result
         except Exception as exc:
