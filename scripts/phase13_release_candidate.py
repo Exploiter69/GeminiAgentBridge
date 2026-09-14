@@ -30,8 +30,8 @@ REQUIRED_FILES = (
     "tests/test_phase8_compatibility.py", "tests/test_phase9_trajectory.py", "tests/test_phase10_observability.py",
     "tests/test_phase11_feature_porting.py", "tests/test_phase12_performance.py", "tests/test_phase13_release_candidate.py",
     "scripts/live_gemini_web_test.py", "scripts/phase8_client_compat.py", "scripts/phase9_trajectory_benchmark.py",
-    "scripts/phase12_performance_benchmark.py", "scripts/phase13_release_candidate.py", ".github/workflows/phase13-release-candidate.yml",
-    "docs/phase8-real-client-evidence.md", "docs/phase13-release-status.md",
+    "scripts/phase12_performance_benchmark.py", "scripts/long_trajectory_stress.py", "scripts/phase13_release_candidate.py",
+    ".github/workflows/phase13-release-candidate.yml", "docs/phase8-real-client-evidence.md", "docs/phase13-release-status.md",
 )
 PHASE_COMMITS = {
     "phase8": "44572e9d7db1816865ef53086b0f9ea98b61c7ac",
@@ -112,7 +112,8 @@ def main() -> int:
 
     fresh = FRESH_LIVE_EVIDENCE.read_text(encoding="utf-8") if FRESH_LIVE_EVIDENCE.is_file() else ""
     fresh_markers = ("Status: **PASS**", "LIVE_GEMINI_WEB_OK", "LIVE_GEMINI_WEB_STREAM_OK", "Hermes: **PASS**", "OpenCode: **PASS**")
-    add("fresh_authenticated_live_evidence", all(marker in fresh for marker in fresh_markers), "fresh authenticated Gemini Web + agent evidence recorded" if all(marker in fresh for marker in fresh_markers) else "fresh live evidence is not complete")
+    fresh_ok = all(marker in fresh for marker in fresh_markers)
+    add("fresh_authenticated_live_evidence", fresh_ok, "fresh authenticated Gemini Web + agent evidence recorded" if fresh_ok else "fresh live evidence is not complete")
 
     for name, command in [
         ("backend_contract_regression", [sys.executable, "-m", "unittest", "tests.test_backend_contract", "-v"]),
@@ -130,6 +131,7 @@ def main() -> int:
         ("compile_check", [sys.executable, "-m", "compileall", "-q", "gemini_web2api", "scripts"]),
         ("phase9_benchmark", [sys.executable, "scripts/phase9_trajectory_benchmark.py"]),
         ("phase12_benchmark", [sys.executable, "scripts/phase12_performance_benchmark.py"]),
+        ("long_trajectory_stress", [sys.executable, "scripts/long_trajectory_stress.py"]),
     ]:
         run(name, command, timeout=300)
 
