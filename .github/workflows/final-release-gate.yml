@@ -1,0 +1,40 @@
+name: Final Release Gate
+
+on:
+  push:
+    branches: ["fix/full-roadmap"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install build/runtime dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+      - name: Install package
+        run: python -m pip install -e . --no-deps
+      - name: Run deterministic final gate
+        run: python scripts/final_release_gate.py --ci
+      - name: Upload release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-release-gate-${{ matrix.python-version }}
+          path: |
+            artifacts/final-release-gate.json
+            artifacts/wheels/*
+          if-no-files-found: ignore
