@@ -12,11 +12,8 @@ import sys
 
 from gemini_web2api.backend import BackendRequest
 from gemini_web2api.config import CONFIG
+from gemini_web2api.model_catalog import model_name
 from gemini_web2api.modern import _BACKEND
-
-
-def _model_name(value) -> str:
-    return str(getattr(value, "name", None) or getattr(value, "id", None) or value)
 
 
 def _select_model(requested: str | None) -> str:
@@ -25,7 +22,7 @@ def _select_model(requested: str | None) -> str:
     models = _BACKEND.list_models()
     if not models:
         raise RuntimeError("Gemini Web account returned no models")
-    return _model_name(models[0])
+    return model_name(models[0])
 
 
 def main() -> int:
