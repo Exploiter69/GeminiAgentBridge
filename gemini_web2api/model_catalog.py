@@ -4,6 +4,10 @@ from __future__ import annotations
 from typing import Any
 
 
+def available_models(models: list[Any]) -> list[Any]:
+    return [model for model in models if getattr(model, "is_available", True)]
+
+
 def model_name(model: Any) -> str:
     return str(
         getattr(model, "model_name", None)
@@ -29,7 +33,7 @@ def openai_models(models: list[Any]) -> list[dict[str, Any]]:
             "owned_by": "google",
             "description": model_description(model),
         }
-        for model in models
+        for model in available_models(models)
     ]
 
 
@@ -41,5 +45,5 @@ def google_models(models: list[Any]) -> list[dict[str, Any]]:
             "description": model_description(model),
             "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
         }
-        for model in models
+        for model in available_models(models)
     ]
