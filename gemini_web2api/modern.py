@@ -260,6 +260,65 @@ class _ModernBackend:
             finally:
                 self._cleanup_files(paths, request.files)
 
+    @classmethod
+    def _is_retryable_error(cls, exc: Exception) -> bool:
+        """Retry only failures that are plausibly transient.
+
+        Never retry rate limits, authentication/authorization failures,
+        model/request errors, or other deterministic upstream failures.
+        """
+        if isinstance(exc, (asyncio.CancelledError, BackendCapabilityError)):
+            return False
+
+        if cls._is_session_error(exc):
+            return False
+
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+
+        if status is not None:
+            try:
+                status = int(status)
+            except (TypeError, ValueError):
+                status = None
+
+        if status is not None:
+            if status == 429:
+                return False
+            if status in {401, 403, 400, 404, 409, 422}:
+                return False
+            if status in {408, 425} or 500 <= status <= 599:
+                return True
+            return False
+
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+
+        name = type(exc).__name__.lower()
+        text = str(exc).lower()
+
+        transient_tokens = (
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "temporarily unavailable",
+            "temporary failure",
+            "transport error",
+            "remote protocol",
+            "server disconnected",
+        )
+
+        if any(token in name or token in text for token in transient_tokens):
+            return True
+
+        # Empty responses are deterministic and retrying them can duplicate
+        # an otherwise successful upstream request.
+        return False
+
     async def _generate(self, request: BackendRequest) -> BackendResponse:
         attempts = max(1, int(CONFIG.get("retry_attempts", 3)))
         last_error = None
@@ -274,11 +333,20 @@ class _ModernBackend:
                 last_error = exc
                 if self._is_session_error(exc):
                     await self._close_client()
-                if attempt + 1 >= attempts:
+                if (
+                    attempt + 1 >= attempts
+                    or not self._is_retryable_error(exc)
+                ):
                     break
-                delay = min(float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt), float(CONFIG.get("retry_max_delay_sec", 8)))
+                delay = min(
+                    float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt),
+                    float(CONFIG.get("retry_max_delay_sec", 8)),
+                )
                 await asyncio.sleep(delay)
-        self._set_health(BackendHealthState.DEGRADED, error=type(last_error).__name__ if last_error else "unknown error")
+        self._set_health(
+            BackendHealthState.DEGRADED,
+            error=type(last_error).__name__ if last_error else "unknown error",
+        )
         raise last_error
 
     async def _stream_once(self, request: BackendRequest, out: queue.Queue, state: dict) -> None:
@@ -350,9 +418,22 @@ class _ModernBackend:
                     state["error"] = exc
                     if self._is_session_error(exc):
                         await self._close_client()
-                    if state["emitted"] or attempt + 1 >= attempts:
+
+                    # Once bytes have been emitted, retrying would duplicate
+                    # downstream-visible output and potentially side effects.
+                    if (
+                        state["emitted"]
+                        or attempt + 1 >= attempts
+                        or not self._is_retryable_error(exc)
+                    ):
                         break
-                    await asyncio.sleep(min(float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt), float(CONFIG.get("retry_max_delay_sec", 8))))
+
+                    await asyncio.sleep(
+                        min(
+                            float(CONFIG.get("retry_delay_sec", 2)) * (2 ** attempt),
+                            float(CONFIG.get("retry_max_delay_sec", 8)),
+                        )
+                    )
             self._set_health(BackendHealthState.DEGRADED, error=type(state["error"]).__name__ if state["error"] else "stream failed")
             out.put(sentinel)
         future = asyncio.run_coroutine_threadsafe(producer(), loop)

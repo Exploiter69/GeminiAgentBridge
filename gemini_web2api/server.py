@@ -636,7 +636,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Google stream error: {e}")
+                status, payload, headers = self._upstream_error_response(e)
+                error = payload.get("error", {})
+                event = {
+                    "error": {
+                        "type": error.get("type", "upstream_error"),
+                        "message": error.get("message", "upstream error"),
+                    }
+                }
+                if status == 429 and "Retry-After" in headers:
+                    event["error"]["retry_after"] = headers["Retry-After"]
+                try:
+                    self.wfile.write(
+                        f"event: error\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                log(
+                    f"Google stream error: status={status} "
+                    f"type={error.get('type', 'upstream_error')}"
+                )
             return
 
         try:
