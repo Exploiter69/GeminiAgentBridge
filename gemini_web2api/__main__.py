@@ -9,6 +9,7 @@ from .modern import health as modern_health, shutdown as modern_shutdown
 from .server import GeminiHandler
 from .hardened_server import HardenedGeminiHandler, HardenedThreadedServer
 from .security import validate_bind
+from .backend_selection import effective_backend
 from .phase4_runtime import install_phase4_runtime
 from .runtime_observability import install_observability
 from . import __version__
@@ -37,9 +38,16 @@ def main():
         CONFIG["proxy"] = args.proxy
 
     validate_bind(str(CONFIG["host"]), CONFIG.get("api_keys") or [])
-    backend = str(CONFIG.get("upstream_backend", "modern")).lower()
-    if backend not in {"modern", "legacy", "auto"}:
-        raise SystemExit(f"Unsupported upstream_backend: {backend!r}. Expected one of: modern, legacy, auto")
+    configured_backend = str(CONFIG.get("upstream_backend", "auto")).lower()
+    if configured_backend not in {"modern", "legacy", "auto"}:
+        raise SystemExit(
+            f"Unsupported upstream_backend: {configured_backend!r}. "
+            "Expected one of: modern, legacy, auto"
+        )
+    try:
+        backend = effective_backend(configured_backend, CONFIG.get("cookie_file"))
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     if backend == "modern" and not CONFIG.get("cookie_file"):
         raise SystemExit("Gemini Web authentication cookie is required for the modern backend")
 
@@ -56,7 +64,7 @@ def main():
     print(f"  Listening: http://{CONFIG['host']}:{port}")
     print(f"  Base URL:  http://{CONFIG['host']}:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Backend:   {backend}")
+    print(f"  Backend:   {backend} (configured: {configured_backend})")
     print("  Auth:      local-only by default; API keys required for remote bind")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'buffered fallback'}")
     print(f"  Body limit: {int(CONFIG['max_request_body_bytes'])} bytes")
