@@ -10,6 +10,7 @@ import time
 from .config import CONFIG
 from .model_catalog import google_models, openai_models
 from . import modern
+from .backend_selection import effective_backend
 from .observability import TRACE_HEADER, emit_event, new_trace_id
 from .response_semantics import remove_fabricated_usage, sanitize_sse_event
 
@@ -69,13 +70,21 @@ def _install_stream_failure_marker(handler_cls) -> None:
 
 def _dynamic_models(self, path: str) -> bool:
     """Serve account-discovered modern models; return False to use legacy/static path."""
-    if str(CONFIG.get("upstream_backend", "modern")).lower() != "modern":
+    configured = str(CONFIG.get("upstream_backend", "auto")).lower()
+    if configured not in {"modern", "legacy", "auto"}:
         return False
     if path not in {"/v1/models", "/v1beta/models"}:
         return False
     if not self._authorized():
         self.send_json({"error": {"message": "invalid api key"}}, 401)
         return True
+    try:
+        backend = effective_backend(configured, CONFIG.get("cookie_file"))
+    except Exception as exc:
+        self.send_json({"error": {"message": "model catalog unavailable", "type": type(exc).__name__}}, 503)
+        return True
+    if backend != "modern":
+        return False
     try:
         models = modern._BACKEND.list_models()
     except Exception as exc:
@@ -106,7 +115,6 @@ def install_observability(handler_cls) -> None:
         return original_end_headers(self)
 
     def send_json(self, data, status=200):
-        # Gemini Web does not expose authoritative OpenAI token accounting.
         return original_send_json(self, remove_fabricated_usage(data), status)
 
     @functools.wraps(original_do_get)
