@@ -10,7 +10,7 @@ DEFAULT_CONFIG = {
     "retry_backoff_multiplier": 2.0,
     "retry_max_delay_sec": 30.0,
     "request_timeout_sec": 180,
-    "upstream_backend": "modern",
+    "upstream_backend": "auto",
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
