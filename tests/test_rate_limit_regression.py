@@ -1,7 +1,10 @@
 import email.message
 import urllib.error
 import unittest
+from unittest.mock import patch
 
+from gemini_web2api import gemini
+from gemini_web2api.backend import BackendRequest
 from gemini_web2api.gemini import _is_retryable_error
 from gemini_web2api.server import GeminiHandler
 
@@ -94,6 +97,114 @@ class RateLimitRegressionTests(unittest.TestCase):
         self.assertNotIn("upstream", serialized.lower().replace(
             "upstream rate limit", ""
         ))
+
+    def test_legacy_stream_retry_does_not_duplicate_emitted_prefix(self):
+        class FakeResponse:
+            def __init__(self, chunks):
+                self.chunks = iter(chunks)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_text(self):
+                for chunk in self.chunks:
+                    yield chunk
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def stream(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return FakeResponse([
+                        'prefix',
+                        '\n',
+                    ])
+                return FakeResponse([
+                    'prefix-suffix',
+                    '\n',
+                ])
+
+        client = FakeClient()
+        request = BackendRequest(
+            prompt="hello",
+            model=1,
+            stream=True,
+        )
+
+        with patch.object(gemini, "HAS_HTTPX", True),              patch.object(gemini, "_get_httpx_client", return_value=client),              patch.object(gemini, "_reset_httpx_client"),              patch.object(gemini, "_retry_policy", return_value=type(
+                 "Policy",
+                 (),
+                 {
+                     "attempts": 2,
+                     "delay_for_retry": lambda self, attempt: 0,
+                 },
+             )()),              patch.object(
+                 gemini,
+                 "_extract_texts_from_line",
+                 side_effect=[
+                     ["prefix"],
+                     ["prefix-suffix"],
+                 ],
+             ),              patch.object(gemini, "_sleep_before_retry"):
+
+            def failing_stream():
+                yield "prefix"
+                raise ConnectionError("connection dropped")
+
+            class RetryClient:
+                def __init__(self):
+                    self.calls = 0
+
+                def stream(self, *args, **kwargs):
+                    self.calls += 1
+                    if self.calls == 1:
+                        return FakeResponse([])
+
+                    return FakeResponse([])
+
+            retry_client = RetryClient()
+
+            with patch.object(
+                gemini,
+                "_get_httpx_client",
+                return_value=retry_client,
+            ):
+                # Exercise the same retry state machine directly with a
+                # deterministic fake response sequence.
+                emitted = []
+                original = gemini._get_httpx_client
+
+                def client_for_attempt():
+                    return client
+
+                with patch.object(
+                    gemini,
+                    "_get_httpx_client",
+                    side_effect=[client, client],
+                ):
+                    # The first attempt must fail after emitting "prefix".
+                    def first_then_retry(*args, **kwargs):
+                        if client.calls == 0:
+                            client.calls += 1
+                            return FakeResponse(["prefix\n"])
+                        client.calls += 1
+                        return FakeResponse(["prefix-suffix\n"])
+
+                    client.stream = first_then_retry
+
+                    result = list(gemini._legacy_stream(request))
+                    emitted.extend(result)
+
+                self.assertEqual(emitted, ["prefix", "-suffix"])
+                self.assertEqual(client.calls, 2)
 
     def test_unknown_upstream_errors_remain_502(self):
         status, payload, headers = (
