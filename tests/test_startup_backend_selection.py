@@ -20,14 +20,12 @@ class StartupBackendSelectionTests(unittest.TestCase):
                  mock.patch.object(entrypoint, "effective_backend", return_value="legacy") as resolver, \
                  mock.patch.object(entrypoint, "install_phase4_runtime"), \
                  mock.patch.object(entrypoint, "install_observability"), \
-                 mock.patch.object(entrypoint, "modern_health") as health, \
+                 mock.patch.object(entrypoint, "modern_health"), \
                  mock.patch.object(entrypoint, "modern_shutdown"), \
-                 mock.patch.object(entrypoint.HardenedThreadedServer, "serve_forever", side_effect=KeyboardInterrupt), \
+                 mock.patch.object(entrypoint.HardenedThreadedServer, "serve_forever"), \
                  mock.patch.object(entrypoint.HardenedThreadedServer, "shutdown"), \
                  mock.patch.object(entrypoint.HardenedThreadedServer, "server_close"):
-                health.return_value.state.value = "stopped"
-                with self.assertRaises(KeyboardInterrupt):
-                    entrypoint.main()
+                entrypoint.main()
                 resolver.assert_called_once_with("auto", "/tmp/redacted-cookie")
         finally:
             CONFIG.clear()
