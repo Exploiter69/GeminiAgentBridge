@@ -14,7 +14,8 @@ class StartupBackendSelectionTests(unittest.TestCase):
         try:
             CONFIG.update(DEFAULT_CONFIG)
             CONFIG["cookie_file"] = "/tmp/redacted-cookie"
-            with mock.patch.object(entrypoint, "load_config"), \
+            with mock.patch("sys.argv", ["gemini-agent-bridge"]), \
+                 mock.patch.object(entrypoint, "load_config"), \
                  mock.patch.object(entrypoint, "find_config", return_value=None), \
                  mock.patch.object(entrypoint, "validate_bind"), \
                  mock.patch.object(entrypoint, "effective_backend", return_value="legacy") as resolver, \

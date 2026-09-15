@@ -155,6 +155,7 @@ class StreamingEndpointTests(unittest.TestCase):
     def setUp(self):
         self.original_config = dict(CONFIG)
         CONFIG["api_keys"] = []
+        CONFIG["upstream_backend"] = "legacy"
         CONFIG["log_requests"] = False
 
     def tearDown(self):

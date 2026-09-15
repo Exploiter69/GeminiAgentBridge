@@ -63,6 +63,7 @@ class Phase2ProtocolTests(unittest.TestCase):
     def test_chat_completion_returns_openai_tool_call(self):
         original_config = dict(CONFIG)
         CONFIG["api_keys"] = []
+        CONFIG["upstream_backend"] = "legacy"
         bridge = server.ThreadedServer(("127.0.0.1", 0), server.GeminiHandler)
         thread = threading.Thread(target=bridge.serve_forever, daemon=True)
         bridge.allow_reuse_address = True

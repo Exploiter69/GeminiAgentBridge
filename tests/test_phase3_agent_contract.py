@@ -52,6 +52,7 @@ class Phase3AgentContractTests(unittest.TestCase):
     def setUp_server(self):
         original_config = dict(CONFIG)
         CONFIG["api_keys"] = []
+        CONFIG["upstream_backend"] = "legacy"
         bridge = server.ThreadedServer(("127.0.0.1", 0), server.GeminiHandler)
         thread = threading.Thread(target=bridge.serve_forever, daemon=True)
         thread.start()
