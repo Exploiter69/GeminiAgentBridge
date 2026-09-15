@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import re
+import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -95,6 +96,58 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
+
+    @staticmethod
+    def _upstream_error_response(exc: Exception) -> tuple[int, dict, dict]:
+        """Map upstream failures to safe HTTP semantics.
+
+        Credentials, response bodies, and upstream payloads are never exposed.
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            status = int(exc.code)
+
+            if status == 429:
+                headers = {}
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                if retry_after:
+                    headers["Retry-After"] = retry_after
+                return (
+                    429,
+                    {"error": {
+                        "message": "upstream rate limit",
+                        "type": "rate_limit",
+                    }},
+                    headers,
+                )
+
+            if status in (401, 403):
+                return (
+                    status,
+                    {"error": {
+                        "message": "upstream authentication/session rejected",
+                        "type": "authentication_error",
+                    }},
+                    {},
+                )
+
+            if 500 <= status <= 599:
+                return (
+                    502,
+                    {"error": {
+                        "message": "upstream server error",
+                        "type": "upstream_error",
+                    }},
+                    {},
+                )
+
+        return (
+            502,
+            {"error": {
+                "message": "upstream request failed",
+                "type": "upstream_error",
+            }},
+            {},
+        )
 
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
@@ -228,13 +281,45 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Stream error: {e}")
+                status, payload, headers = self._upstream_error_response(e)
+                # SSE headers are already committed, so preserve the error
+                # semantically inside the stream rather than pretending the
+                # request completed successfully.
+                error = payload.get("error", {})
+                event = {
+                    "error": {
+                        "type": error.get("type", "upstream_error"),
+                        "message": error.get("message", "upstream error"),
+                    }
+                }
+                if status == 429 and "Retry-After" in headers:
+                    event["error"]["retry_after"] = headers["Retry-After"]
+                try:
+                    self.wfile.write(
+                        f"event: error\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                log(
+                    f"Stream error: status={status} "
+                    f"type={error.get('type', 'upstream_error')}"
+                )
             return
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            status, payload, headers = self._upstream_error_response(e)
+            body = json.dumps(payload, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         tool_calls = None
@@ -247,9 +332,49 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._start_sse()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+
+            # Keep OpenAI-compatible streaming semantics explicit. Tool calls
+            # are delivered as deltas and the terminal finish_reason is a
+            # separate chunk so AI SDK/OpenCode can accumulate the call before
+            # advancing the agent loop.
+            def emit_stream_chunk(delta, finish_reason=None):
+                chunk = {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": finish_reason,
+                    }],
+                }
+                self.wfile.write(
+                    f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+                )
+
+            emit_stream_chunk({"role": "assistant"})
+
+            if tool_calls:
+                for index, call in enumerate(tool_calls):
+                    function = call.get("function", {})
+                    emit_stream_chunk({
+                        "tool_calls": [{
+                            "index": index,
+                            "id": call.get("id", f"call_{index}"),
+                            "type": "function",
+                            "function": {
+                                "name": function.get("name", ""),
+                                "arguments": function.get("arguments", "{}"),
+                            },
+                        }]
+                    })
+                emit_stream_chunk({}, "tool_calls")
+            else:
+                if msg.get("content"):
+                    emit_stream_chunk({"content": msg["content"]})
+                emit_stream_chunk({}, "stop")
+
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
@@ -289,6 +414,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     if item.get("type") == "function_call_output":
                         messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
                                          "name": item.get("name", ""), "content": item.get("output", "")})
+                    elif item.get("type") == "function_call":
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": item.get("call_id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", "{}"),
+                                },
+                            }],
+                        })
                     elif item.get("type") in ("input_text", "input_image", "image"):
                         messages.append({"role": "user", "content": [item]})
                     elif item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant"):
@@ -327,7 +465,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
             file_refs = _upload_images(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            status, payload, headers = self._upstream_error_response(e)
+            body = json.dumps(payload, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         tool_calls = None
@@ -542,7 +689,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Google stream error: {e}")
+                status, payload, headers = self._upstream_error_response(e)
+                error = payload.get("error", {})
+                event = {
+                    "error": {
+                        "type": error.get("type", "upstream_error"),
+                        "message": error.get("message", "upstream error"),
+                    }
+                }
+                if status == 429 and "Retry-After" in headers:
+                    event["error"]["retry_after"] = headers["Retry-After"]
+                try:
+                    self.wfile.write(
+                        f"event: error\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                log(
+                    f"Google stream error: status={status} "
+                    f"type={error.get('type', 'upstream_error')}"
+                )
             return
 
         try:

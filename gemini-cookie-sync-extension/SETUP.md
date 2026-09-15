@@ -62,7 +62,7 @@ Check only the path and permissions:
 stat -c '%A %U:%G %n' /path/to/gemini-auth.json
 ```
 
-Do **not** use `cat`, `jq .`, or any command that prints the credential values when collecting diagnostics.
+Do **not** use `cat`, `jq .`, or any command that prints the credential values when collecting diagnostics. Do not share or commit the exported session file.
 
 A healthy-looking file is not proof that Gemini accepts the session. The upstream client must report an authenticated account and a real generation request must succeed.
 

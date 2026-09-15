@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 from types import ModuleType
 
 from .config import CONFIG
@@ -147,9 +148,25 @@ def install_phase4_runtime(handler_cls) -> None:
         )
 
     def recover_error(exc: BaseException) -> RuntimeError:
+        # Preserve HTTPError so the HTTP boundary can retain upstream
+        # semantics such as 429 + Retry-After instead of turning them into
+        # an indistinguishable 502.
+        if isinstance(exc, urllib.error.HTTPError):
+            failure = classify_exception(exc)
+            module.log(
+                f"Phase5 upstream failure type={failure.error_type.value} "
+                f"retryable={failure.retryable} status={exc.code}"
+            )
+            raise exc
+
         failure = classify_exception(exc)
-        module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
-        return RuntimeError(f"upstream {failure.error_type.value}: {failure.message}")
+        module.log(
+            f"Phase5 upstream failure type={failure.error_type.value} "
+            f"retryable={failure.retryable}"
+        )
+        return RuntimeError(
+            f"upstream {failure.error_type.value}: {failure.message}"
+        )
 
     def recover_raw(raw):
         failure = classify_upstream_text(raw)
@@ -207,10 +224,15 @@ def install_phase4_runtime(handler_cls) -> None:
     def parse_calls(text: str):
         tool_defs, tool_choice = _current_tool_context()
         clean, calls = parse_tool_calls_robust(text)
-        errors = validate_tool_calls(calls, tool_defs)
+        errors = validate_tool_choice(tool_choice, tool_defs)
+        errors.extend(validate_tool_calls(calls, tool_defs))
         errors.extend(_choice_errors(calls, tool_defs, tool_choice))
         if errors:
-            return clean, calls
+            phase4_tools.clear_tool_context()
+            raise ValueError(
+                "invalid tool call protocol: " + "; ".join(errors[:8])
+            )
+        phase4_tools.clear_tool_context()
         return clean, calls
 
     handler_cls.send_json = send_json

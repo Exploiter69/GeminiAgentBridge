@@ -1,40 +1,40 @@
 # Phase 13 Release Candidate Status
 
-Phase 13 is the durable record of the independent repository-level release gate performed before the current live Gemini Web transport repair.
+Phase 13 is the durable record of the repository-level release gate performed
+before promotion of the repaired Gemini Web transport.
 
-## What Phase 13 proved
+## Historical evidence
 
-- repository/git integrity checks passed;
-- historical phase commits were checked as ancestors of the candidate;
-- compile, credential-pattern, full-suite, trajectory, and performance gates were executed independently;
-- the durable Hermes/OpenCode real-client evidence existed and contained the required 13/13 + 13/13 result;
-- machine-readable release evidence and a SHA-256 manifest were emitted under `artifacts/`;
-- the verifier recorded `agent_claims_used_as_verification: false`.
-
-## Historical result
-
-Phase 13 produced a `GO` for the codebase that existed at that point and was merged at:
+An earlier Phase 13 run produced a historical `GO` for the then-current codebase
+and was merged at:
 
 ```text
 a6e9e72bfe09a35974a456779ac8afeaad775477
 ```
 
-## Important status correction
-
-The subsequent live-client investigation found that the old default execution path could still reach the historical direct `StreamGenerate` implementation and produce HTTP 405/429 behavior. The current repair branch therefore changes the live upstream transport.
-
-That means the Phase 13 `GO` is **historical evidence**, not a release certificate for the changed transport.
+That result is retained as regression evidence only. It is **not** a release
+certificate for the current transport repair.
 
 ## Current release gate
 
-The current transport repair must establish all of the following again:
+The current candidate must prove all of the following again:
 
-- maintained modern Gemini Web transport is the actual live path;
-- a fresh authenticated Gemini Web session can generate non-streaming output;
-- the same session can generate streaming output;
-- Hermes can use the resulting server for real agent work;
-- OpenCode can use the resulting server where installed;
-- streaming failures are not misreported as successful completions;
-- deterministic regression and credential-safety gates remain green.
+- backend capability and health lifecycle contracts are deterministic;
+- unsupported semantics are explicit and token usage is never fabricated;
+- streaming failures after HTTP commitment produce an explicit error event and no
+  false `[DONE]` success marker;
+- Responses compatibility does not invent unavailable provider metadata;
+- legacy transport remains available only behind an explicit compatibility boundary;
+- package/module/entry-point compatibility is tested;
+- session-extension behavior is credential-safe and local-only;
+- long-trajectory and performance regression suites remain green;
+- a **fresh authenticated Gemini Web** non-streaming and streaming run succeeds;
+- **fresh Hermes and OpenCode agent runs** succeed against the repaired branch;
+- the independent Phase 13 verifier returns `GO` only after the fresh evidence is
+  recorded.
 
-Until those conditions are met, the repair branch remains unreleased.
+Fresh evidence is maintained in [`docs/fresh-live-evidence.md`](fresh-live-evidence.md)
+without storing any credential material.
+
+Until those conditions are met, the repair branch remains unreleased and must not
+be merged.

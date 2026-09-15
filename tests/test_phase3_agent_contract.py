@@ -128,6 +128,63 @@ class Phase3AgentContractTests(unittest.TestCase):
         finally:
             self.tearDown_server()
 
+    def test_responses_api_preserves_top_level_function_call_input(self):
+        self.setUp_server()
+        try:
+            with mock.patch(
+                "gemini_web2api.server.generate",
+                return_value="Tool result acknowledged.",
+            ) as upstream:
+                status, body = self._call("/v1/responses", {
+                    "model": "gemini-3.1-pro",
+                    "input": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_read",
+                            "name": "read_file",
+                            "arguments": '{"path":"app.py"}',
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_read",
+                            "name": "read_file",
+                            "output": "print('ok')",
+                        },
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read_file",
+                            "parameters": self.tools[0]["function"]["parameters"],
+                        }
+                    ],
+                })
+
+            self.assertEqual(status, 200)
+            prompt = upstream.call_args.args[0]
+
+            # The prior function call must survive as an assistant tool call.
+            self.assertIn("[Assistant]:", prompt)
+            self.assertIn('"name": "read_file"', prompt)
+            self.assertIn('"path":"app.py"', prompt)
+            self.assertIn("Tool result for read_file", prompt)
+            self.assertIn("print('ok')", prompt)
+
+            # The corresponding observation must remain a tool result.
+            self.assertIn("Tool result for read_file", prompt)
+            self.assertIn("print('ok')", prompt)
+
+            self.assertEqual(
+                body["output"][0]["type"],
+                "message",
+            )
+            self.assertIn(
+                "Tool result acknowledged.",
+                body["output"][0]["content"][0]["text"],
+            )
+        finally:
+            self.tearDown_server()
+
     def test_tool_messages_are_not_lost_when_no_tools_are_requested(self):
         prompt, _ = tools.messages_to_prompt([
             {"role": "user", "content": "hello"},
