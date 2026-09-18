@@ -9,7 +9,9 @@ The repair branch therefore separates:
 - **modern transport** — maintained `gemini-webapi` client;
 - **legacy transport** — the old direct `StreamGenerate` implementation retained only for explicit compatibility.
 
-The package default is `modern`.
+The shipped `config.example.json` pins `upstream_backend` to `modern` explicitly, so a fresh install that copies it as documented in the Quick Start starts on the modern transport.
+
+The package's own built-in default (used when `upstream_backend` is omitted from config entirely) is `auto`, which resolves to `modern` only when the configured `cookie_file` contains modern-format (`Secure_1PSID`) cookies, and otherwise resolves to `legacy` — including a completely unauthenticated startup. A minimal or custom config that omits `upstream_backend` and does not yet have a modern-format cookie file in place will silently start on `legacy`, not `modern`. See `effective_backend()` in `gemini_web2api/backend_selection.py` for the exact resolution rule.
 
 ## Modern backend
 

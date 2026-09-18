@@ -33,7 +33,7 @@ Authenticated Gemini Web session
 
 ## Release-line guarantees
 
-- Modern `gemini-webapi==2.1.1` transport is the default.
+- Modern `gemini-webapi==2.1.1` transport is what `config.example.json` starts on. The package's own built-in default is `auto`, which resolves to `modern` only when the configured cookie file is in modern (`Secure_1PSID`) format, and otherwise resolves to `legacy` — see [docs/live-transport.md](docs/live-transport.md) for the exact rule.
 - Modern model names are resolved against the authenticated account at runtime; the compatibility aliases in this repository are not guarantees that a particular model exists on every account.
 - Default listener is `127.0.0.1`; non-loopback binding requires configured API keys.
 - Request bodies and remote image downloads are bounded.

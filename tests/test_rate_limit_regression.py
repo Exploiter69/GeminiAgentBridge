@@ -173,6 +173,33 @@ class RateLimitRegressionTests(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "upstream_error")
         self.assertEqual(headers, {})
 
+    def test_tool_call_recovery_failure_is_not_reported_as_upstream_502(self):
+        # Regression for the reported OpenCode failure: a bounded tool-call
+        # repair failure (see phase4_runtime.repair_tool_response) is a
+        # bridge-side protocol mismatch, not an upstream connectivity fault.
+        # Reporting it as a generic 502 "upstream request failed" is
+        # indistinguishable from a real backend outage to the calling agent
+        # and was observed to cause agents to abandon otherwise-recoverable
+        # tasks. It must be reported as its own explicit, client-visible
+        # error instead of collapsing into the upstream-error bucket.
+        exc = RuntimeError("tool_call_recovery_failed: missing_required_argument")
+
+        status, payload, headers = GeminiHandler._upstream_error_response(exc)
+
+        self.assertNotEqual(status, 502)
+        self.assertEqual(status, 422)
+        self.assertEqual(payload["error"]["type"], "tool_call_recovery_failed")
+        self.assertEqual(payload["error"]["code"], "missing_required_argument")
+        self.assertEqual(headers, {})
+
+    def test_tool_call_recovery_failure_reason_is_preserved_for_other_types(self):
+        for reason in ("invalid_tool_schema", "malformed_tool_call", "invalid_tool_choice"):
+            with self.subTest(reason=reason):
+                exc = RuntimeError(f"tool_call_recovery_failed: {reason}")
+                status, payload, _ = GeminiHandler._upstream_error_response(exc)
+                self.assertEqual(status, 422)
+                self.assertEqual(payload["error"]["code"], reason)
+
 
 if __name__ == "__main__":
     unittest.main()

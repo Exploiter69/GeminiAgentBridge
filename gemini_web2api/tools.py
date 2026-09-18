@@ -84,6 +84,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None, gro
     budget = max_chars if max_chars is not None else int(CONFIG.get("prompt_soft_budget_chars", 0))
     if budget > 0: messages, _ = compact_messages(messages, budget)
     parts, images = [], []
+    call_id_to_name: dict[str, str] = {}
     if grounding and grounding.is_explicit: parts.append(grounding.to_prompt())
     if tool_defs and tool_choice != "none":
         constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
@@ -106,10 +107,24 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None, gro
                 tc_strs = []
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})
+                    name = fn.get("name")
+                    call_id = tc.get("id")
+                    if call_id:
+                        # A standard OpenAI-shaped tool-result message only
+                        # carries "tool_call_id", not "name" (the "name" field
+                        # belongs to the deprecated function-role message
+                        # shape). Without this map, every downstream tool
+                        # result renders as an anonymous "[Tool result for ]"
+                        # block, so the model loses which result answers
+                        # which call as soon as a trajectory has more than one
+                        # outstanding tool call.
+                        call_id_to_name[call_id] = name
                     tc_strs.append(f'```tool_call\n{{"name": "{fn.get("name")}", "arguments": {fn.get("arguments", "{}")}}}\n```')
                 parts.append(f"[Assistant]: {content or ''}\n" + "\n".join(tc_strs))
             else: parts.append(f"[Assistant]: {content}")
-        elif role == "tool": parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
+        elif role == "tool":
+            name = msg.get("name") or call_id_to_name.get(msg.get("tool_call_id")) or "unknown_tool"
+            parts.append(f"[Tool result for {name}]: {content}")
         else: parts.append(content if content else "")
     return "\n\n".join(p for p in parts if p), images
 

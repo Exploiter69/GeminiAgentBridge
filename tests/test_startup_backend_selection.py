@@ -24,8 +24,7 @@ class StartupBackendSelectionTests(unittest.TestCase):
                  mock.patch.object(entrypoint, "modern_health"), \
                  mock.patch.object(entrypoint, "modern_shutdown"), \
                  mock.patch.object(entrypoint.HardenedThreadedServer, "serve_forever"), \
-                 mock.patch.object(entrypoint.HardenedThreadedServer, "shutdown"), \
-                 mock.patch.object(entrypoint.HardenedThreadedServer, "server_close"):
+                 mock.patch.object(entrypoint.HardenedThreadedServer, "shutdown"):
                 entrypoint.main()
                 resolver.assert_called_once_with("auto", "/tmp/redacted-cookie")
         finally:

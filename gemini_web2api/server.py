@@ -102,7 +102,33 @@ class GeminiHandler(BaseHTTPRequestHandler):
         """Map upstream failures to safe HTTP semantics.
 
         Credentials, response bodies, and upstream payloads are never exposed.
+
+        A tool-call that could not be reconciled with the client's declared
+        schema after a bounded repair attempt (see phase4_runtime.repair_tool_response)
+        is NOT an upstream connectivity failure: Gemini answered successfully,
+        the bridge's own protocol adaptation failed. Collapsing it into the
+        generic "upstream request failed" 502 makes it indistinguishable from a
+        real backend outage to the calling agent, which can cause the agent to
+        treat a recoverable, request-scoped protocol mismatch as a fatal
+        infrastructure fault and abandon the task instead of surfacing/retrying
+        the tool call. Report it as its own client-visible error instead.
         """
+        message = str(exc)
+        if isinstance(exc, RuntimeError) and message.startswith("tool_call_recovery_failed:"):
+            reason = message.split(":", 1)[1].strip() or "unknown"
+            return (
+                422,
+                {"error": {
+                    "message": (
+                        "the model's tool call could not be reconciled with the "
+                        f"declared tool schema after repair (reason: {reason})"
+                    ),
+                    "type": "tool_call_recovery_failed",
+                    "code": reason,
+                }},
+                {},
+            )
+
         if isinstance(exc, urllib.error.HTTPError):
             status = int(exc.code)
 
@@ -218,10 +244,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            log(f"POST error: {e}")
+            # This is the last-resort boundary for exceptions the inner
+            # handlers did not anticipate (e.g. a bug, or a raw exception
+            # from a helper that isn't itself an upstream-classified
+            # RuntimeError). Every other error path in this file is careful
+            # to redact upstream details (see _upstream_error_response); this
+            # one must be too. str(e) can legitimately contain fragments of
+            # the outgoing Gemini request (URLError/HTTPError string forms
+            # include the request URL, which carries the session XSRF token
+            # as a query parameter), so it must never be logged verbatim or
+            # echoed back to the calling HTTP client.
+            log(f"POST error: {type(e).__name__}")
             try:
-                self.send_json({"error": {"message": str(e)}}, 500)
-            except:
+                self.send_json({"error": {"message": "internal server error"}}, 500)
+            except Exception:
                 pass
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────

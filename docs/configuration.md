@@ -31,13 +31,13 @@
 | Key | Default | Meaning |
 |---|---:|---|
 | `port` | `8081` | HTTP listen port |
-| `host` | `0.0.0.0` | Listen address |
+| `host` | `127.0.0.1` | Listen address (loopback-only by default; binding beyond loopback requires `api_keys` to be set) |
 | `retry_attempts` | `3` | Maximum bounded upstream attempts |
 | `retry_delay_sec` | `2` | Initial retry delay |
 | `retry_backoff_multiplier` | `2.0` | Exponential retry multiplier |
 | `retry_max_delay_sec` | `30.0` | Retry delay cap |
 | `request_timeout_sec` | `180` | Upstream request timeout |
-| `upstream_backend` | `modern` | `modern` for maintained Gemini Web transport; `legacy` only for explicit compatibility |
+| `upstream_backend` | `auto` | `auto` resolves to `modern` only when `cookie_file` is already in modern (`Secure_1PSID`) format, otherwise `legacy`; set explicitly to `modern` or `legacy` to pin it (see [live-transport.md](live-transport.md)) |
 | `gemini_bl` | project default | Legacy protocol metadata retained for compatibility; not the modern transport's primary model-selection mechanism |
 | `auth_user` | `null` | Legacy/account-index compatibility field |
 | `xsrf_token` | `null` | Legacy/XSRF compatibility field |
@@ -47,7 +47,7 @@
 | `proxy` | `null` | Explicit HTTP proxy for the modern client; environment proxy settings may also apply |
 | `log_requests` | `true` | Request logging switch used by the server layer |
 | `temporary_chats` | `false` | Ask the modern client for temporary Gemini chats where supported |
-| `prompt_soft_budget_chars` | `0` | Optional prompt-size soft budget; `0` disables this limit |
+| `prompt_soft_budget_chars` | `100000` | Prompt-size soft budget used to compact message history; the compactor never deletes tool schema constraints just to hit this |
 | `tool_schema_budget_chars` | `30000` | Tool-schema serialization budget |
 | `tool_repair_attempts` | `1` | Bounded schema/format repair attempts |
 | `planner_enabled` | `false` | Experimental Phase 7 planner flag; keep disabled unless explicitly testing it |
