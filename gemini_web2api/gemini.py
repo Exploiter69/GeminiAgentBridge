@@ -15,6 +15,7 @@ try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
+    httpx = None
     HAS_HTTPX = False
 
 from .backend import BackendFile, BackendRequest
@@ -390,7 +391,7 @@ def _legacy_stream(request: BackendRequest):
             last_err = e
             if attempt >= policy.attempts - 1 or not _is_retryable_error(e):
                 break
-            if HAS_HTTPX and isinstance(e, httpx.TransportError):
+            if HAS_HTTPX and httpx is not None and isinstance(e, httpx.TransportError):
                 _reset_httpx_client()
             _sleep_before_retry(policy, attempt, e)
     raise last_err
