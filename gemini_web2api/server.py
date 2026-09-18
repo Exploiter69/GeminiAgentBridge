@@ -15,11 +15,6 @@ from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
 
-def _usage(prompt: str, text: str) -> dict:
-    p = len(prompt) // 4
-    c = len(text or "") // 4
-    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
-
 
 def _upload_images(images: list) -> list:
     """Upload images and return list of file references. Returns None if no images."""
@@ -418,8 +413,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
-                          "total_tokens": (len(prompt)+len(text or ""))//4},
             })
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
@@ -544,11 +537,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode()
                 )
 
-            usage = {
-                "input_tokens": len(prompt) // 4,
-                "output_tokens": len(text or "") // 4,
-                "total_tokens": (len(prompt) + len(text or "")) // 4,
-            }
             base_response = {
                 "id": rid,
                 "object": "response",
@@ -561,7 +549,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     **base_response,
                     "status": "in_progress",
                     "output": [],
-                    "usage": None,
                 },
             )
             emit(
@@ -570,7 +557,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     **base_response,
                     "status": "in_progress",
                     "output": [],
-                    "usage": None,
                 },
             )
             for output_index, item in enumerate(output):
@@ -659,14 +645,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     **base_response,
                     "status": "completed",
                     "output": output,
-                    "usage": usage,
                 },
             )
             self.wfile.flush()
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output,
-                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
+                            "model": model_name, "output": output})
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
@@ -713,11 +697,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 final_chunk = {
                     "candidates": [{"finishReason": "STOP", "index": 0}],
-                    "usageMetadata": {
-                        "promptTokenCount": len(prompt) // 4,
-                        "candidatesTokenCount": len(full_text) // 4,
-                        "totalTokenCount": (len(prompt) + len(full_text)) // 4,
-                    },
                     "modelVersion": model_name,
                 }
                 self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
@@ -775,14 +754,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "finishReason": "STOP",
             "index": 0,
         }
-        usage = {
-            "promptTokenCount": len(prompt) // 4,
-            "candidatesTokenCount": len(text or "") // 4,
-            "totalTokenCount": (len(prompt) + len(text or "")) // 4,
-        }
         response_obj = {
             "candidates": [candidate],
-            "usageMetadata": usage,
             "modelVersion": model_name,
         }
 
