@@ -23,7 +23,7 @@ class StartupBackendSelectionTests(unittest.TestCase):
                  mock.patch.object(entrypoint, "install_observability"), \
                  mock.patch.object(entrypoint, "modern_health"), \
                  mock.patch.object(entrypoint, "modern_shutdown"), \
-                 mock.patch.object(entrypoint.HardenedThreadedServer) as server_cls:
+                 mock.patch.object(entrypoint, "HardenedThreadedServer") as server_cls:
                 entrypoint.main()
                 resolver.assert_called_once_with("auto", "/tmp/redacted-cookie")
                 server_cls.assert_called_once_with(("127.0.0.1", DEFAULT_CONFIG["port"]), entrypoint.HardenedGeminiHandler)
