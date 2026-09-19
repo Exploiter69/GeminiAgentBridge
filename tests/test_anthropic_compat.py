@@ -81,3 +81,19 @@ def test_anthropic_tool_choice_mapping():
     assert anthropic_tool_choice_to_openai("none") == "none"
     assert anthropic_tool_choice_to_openai("required") == "required"
     assert anthropic_tool_choice_to_openai({"type": "any"}) == "required"
+
+
+
+def test_hardened_handler_dispatches_anthropic_messages():
+    from gemini_web2api.hardened_server import HardenedGeminiHandler
+
+    handler = HardenedGeminiHandler.__new__(HardenedGeminiHandler)
+    handler.path = "/v1/messages"
+    handler._authorized = lambda: True
+    handler._read_request_body = lambda: b'{"messages":[{"role":"user","content":"hello"}]}'
+    calls = []
+    handler._handle_anthropic_messages = lambda body: calls.append(body)
+
+    HardenedGeminiHandler.do_POST(handler)
+
+    assert calls == [b'{"messages":[{"role":"user","content":"hello"}]}']
