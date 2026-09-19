@@ -217,8 +217,18 @@ class RuntimeIntegrationTests(unittest.TestCase):
             body = b'{"messages":[{"role":"user","content":"hello"}],"tools":[{"name":"calculator"}],"tool_choice":{"type":"tool","name":"calculator"}}'
             result = handler._handle_anthropic_messages(body)
             self.assertEqual(result, "handled")
-            self.assertEqual(seen[0][1], {"type":"tool","name":"calculator"})
-            self.assertEqual(seen[0][0], [{"name":"calculator"}])
+            self.assertEqual(seen[0][1], {"function": {"name": "calculator"}})
+            self.assertEqual(
+                seen[0][0],
+                [{
+                    "type": "function",
+                    "function": {
+                        "name": "calculator",
+                        "description": "",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }],
+            )
             self.assertEqual(seen[0][2], body)
         finally:
             sys.modules.pop(module_name, None)
