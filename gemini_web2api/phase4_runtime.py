@@ -65,6 +65,7 @@ def install_phase4_runtime(handler_cls) -> None:
     original_log_message = getattr(handler_cls, "log_message", None)
     original_chat = getattr(handler_cls, "_handle_chat", None)
     original_responses = getattr(handler_cls, "_handle_responses", None)
+    original_anthropic = getattr(handler_cls, "_handle_anthropic_messages", None)
 
     original_generate = getattr(module, "generate", None)
     original_generate_stream = getattr(module, "generate_stream", None)
@@ -137,6 +138,14 @@ def install_phase4_runtime(handler_cls) -> None:
             req = None
         _set_request(req)
         return original_responses(self, body) if original_responses else None
+
+    def handle_anthropic(self, body):
+        try:
+            req = json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+        except (TypeError, json.JSONDecodeError):
+            req = None
+        _set_request(req)
+        return original_anthropic(self, body) if original_anthropic else None
 
     def phase4_messages(messages, tools=None, tool_choice=None, *args, **kwargs):
         return phase4_tools.messages_to_prompt(
@@ -246,6 +255,8 @@ def install_phase4_runtime(handler_cls) -> None:
         handler_cls._handle_chat = handle_chat
     if original_responses:
         handler_cls._handle_responses = handle_responses
+    if original_anthropic:
+        handler_cls._handle_anthropic_messages = handle_anthropic
 
     module.messages_to_prompt = phase4_messages
     module.parse_tool_calls = parse_calls
