@@ -11,6 +11,7 @@ from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .anthropic_compat import anthropic_messages_to_openai, anthropic_response
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
@@ -230,6 +231,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
+            elif self.path == "/v1/messages":
+                self._handle_anthropic_messages(body)
             elif ":streamGenerateContent" in self.path:
                 self._handle_google_generate(body, stream=True)
             elif ":generateContent" in self.path:
@@ -414,6 +417,91 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
             })
+
+    # ─── /v1/messages (Anthropic Messages API / Claude Code) ────────────────
+
+    def _handle_anthropic_messages(self, body: bytes):
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON"}}, 400)
+            return
+        if not isinstance(req.get("messages"), list) or not req["messages"]:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "messages must be a non-empty array"}}, 400)
+            return
+        request_model = str(req.get("model") or "claude-sonnet-4-6")
+        backend_model = CONFIG["default_model"] if request_model.startswith("claude-") else request_model
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(backend_model)
+        if err:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": err}}, 400)
+            return
+
+        try:
+            messages, tools, tool_choice = anthropic_messages_to_openai(req)
+            prompt, images = messages_to_prompt(messages, tools, tool_choice)
+            if not prompt.strip():
+                raise ValueError("empty prompt")
+            file_refs = _upload_images(images)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            tool_calls = None
+            if tools and text and tool_choice != "none":
+                text, tool_calls = parse_tool_calls(text)
+        except ValueError as e:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}}, 400)
+            return
+        except Exception as e:
+            status, payload, headers = self._upstream_error_response(e)
+            error = payload.get("error", {})
+            self.send_json({"type": "error", "error": {
+                "type": error.get("type", "upstream_error"),
+                "message": error.get("message", "upstream request failed"),
+            }}, status)
+            return
+
+        mid = "msg_" + uuid.uuid4().hex[:24]
+        response = anthropic_response(
+            request_model=request_model,
+            text=text or "",
+            tool_calls=tool_calls,
+            message_id=mid,
+        )
+        if not req.get("stream"):
+            self.send_json(response)
+            return
+
+        self._start_sse()
+        def emit(event_type: str, data: dict):
+            self.wfile.write(("event: " + event_type + "\ndata: " + json.dumps(data, ensure_ascii=False) + "\n\n").encode())
+            self.wfile.flush()
+
+        emit("message_start", {
+            "type": "message_start", "message": {
+                "id": mid, "type": "message", "role": "assistant",
+                "model": request_model, "content": [], "stop_reason": None,
+                "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}
+        }})
+        index = 0
+        if text:
+            emit("content_block_start", {"type": "content_block_start", "index": index,
+                  "content_block": {"type": "text", "text": ""}})
+            emit("content_block_delta", {"type": "content_block_delta", "index": index,
+                  "delta": {"type": "text_delta", "text": text}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": index})
+            index += 1
+        for call in tool_calls or []:
+            fn = call.get("function", {})
+            arguments = fn.get("arguments", "{}")
+            emit("content_block_start", {"type": "content_block_start", "index": index,
+                  "content_block": {"type": "tool_use", "id": call.get("id", "call_" + str(index)),
+                  "name": fn.get("name", ""), "input": {}}})
+            emit("content_block_delta", {"type": "content_block_delta", "index": index,
+                  "delta": {"type": "input_json_delta", "partial_json": arguments}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": index})
+            index += 1
+        emit("message_delta", {"type": "message_delta", "delta": {
+            "stop_reason": "tool_use" if tool_calls else "end_turn",
+            "stop_sequence": None}, "usage": {"output_tokens": 0}})
+        emit("message_stop", {"type": "message_stop"})
+        self.wfile.flush()
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 
