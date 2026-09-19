@@ -66,6 +66,11 @@ def install_phase4_runtime(handler_cls) -> None:
     original_chat = getattr(handler_cls, "_handle_chat", None)
     original_responses = getattr(handler_cls, "_handle_responses", None)
     original_anthropic = getattr(handler_cls, "_handle_anthropic_messages", None)
+    # HardenedGeminiHandler inherits the Anthropic handler from GeminiHandler.
+    # Avoid nesting an already-installed wrapper, which would reset normalized
+    # tool context back to the raw Anthropic wire format.
+    if getattr(original_anthropic, "_phase4_anthropic_wrapper", False):
+        original_anthropic = None
 
     original_generate = getattr(module, "generate", None)
     original_generate_stream = getattr(module, "generate_stream", None)
@@ -272,7 +277,9 @@ def install_phase4_runtime(handler_cls) -> None:
     if original_responses:
         handler_cls._handle_responses = handle_responses
     if original_anthropic:
-        handler_cls._handle_anthropic_messages = handle_anthropic
+        handle_anthropic._phase4_anthropic_wrapper = True
+
+    handler_cls._handle_anthropic_messages = handle_anthropic
 
     module.messages_to_prompt = phase4_messages
     module.parse_tool_calls = parse_calls
