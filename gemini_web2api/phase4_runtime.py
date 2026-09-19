@@ -144,7 +144,23 @@ def install_phase4_runtime(handler_cls) -> None:
             req = json.loads(body) if isinstance(body, (bytes, bytearray)) else body
         except (TypeError, json.JSONDecodeError):
             req = None
-        _set_request(req)
+        if isinstance(req, dict):
+            # The Anthropic adapter translates its tool definitions/choice into
+            # the OpenAI-shaped internal protocol before parsing generated tool
+            # calls. Seed the runtime with that same canonical representation;
+            # otherwise recovery validation would compare OpenAI tool calls
+            # against the raw Anthropic wire format.
+            try:
+                from .anthropic_compat import anthropic_messages_to_openai
+                _messages, tools, tool_choice = anthropic_messages_to_openai(req)
+                context_req = dict(req)
+                context_req["tools"] = tools
+                context_req["tool_choice"] = tool_choice
+            except Exception:
+                context_req = req
+        else:
+            context_req = req
+        _set_request(context_req)
         return original_anthropic(self, body) if original_anthropic else None
 
     def phase4_messages(messages, tools=None, tool_choice=None, *args, **kwargs):
