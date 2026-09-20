@@ -15,6 +15,7 @@ from .observability import TRACE_HEADER, elapsed_ms, new_trace_id, request_summa
 from . import tools as phase4_tools
 from .protocol import (
     build_repair_prompt,
+    get_tool_context,
     parse_tool_calls_robust,
     response_needs_repair,
     tool_choice_name,
@@ -43,6 +44,14 @@ def _current_grounding() -> GroundingFacts | None:
 
 
 def _current_tool_context() -> tuple[list[dict], object]:
+    # protocol.py is the authoritative canonical tool context.  The Phase-4
+    # request state intentionally carries lifecycle/grounding data, but keeping
+    # a second authoritative copy of tool choice allowed Anthropic's wire-format
+    # {"type":"tool", ...} to diverge from the normalized protocol choice
+    # {"function":{"name": ...}} seen by the parser.
+    tool_defs, tool_choice = get_tool_context()
+    if tool_defs or tool_choice != "auto":
+        return tool_defs, tool_choice
     return getattr(_state, "tool_defs", []), getattr(_state, "tool_choice", "auto")
 
 
