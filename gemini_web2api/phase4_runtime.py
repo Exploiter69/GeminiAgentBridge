@@ -169,6 +169,13 @@ def install_phase4_runtime(handler_cls) -> None:
         return original_anthropic(self, body) if original_anthropic else None
 
     def phase4_messages(messages, tools=None, tool_choice=None, *args, **kwargs):
+        # messages_to_prompt is the canonical protocol-normalization boundary.
+        # Keep Phase-4 recovery state synchronized with the exact normalized
+        # values passed into the protocol parser.  Without this, the separate
+        # Phase-4 thread-local state can retain the raw Anthropic tool_choice
+        # while protocol.py has the OpenAI-shaped choice.
+        _state.tool_defs = tools or []
+        _state.tool_choice = tool_choice if tool_choice is not None else "auto"
         return phase4_tools.messages_to_prompt(
             messages,
             tools,
