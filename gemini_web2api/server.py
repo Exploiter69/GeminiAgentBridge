@@ -12,7 +12,6 @@ from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .anthropic_compat import anthropic_messages_to_openai, anthropic_response
-from .phase4_runtime import _set_request
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
@@ -438,13 +437,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         try:
             messages, tools, tool_choice = anthropic_messages_to_openai(req)
-            # Seed the recovery runtime from the canonical internal request at the
-            # protocol boundary itself.  The production hardened handler has its
-            # own do_POST wrapper, so relying only on the generic Phase-4 method
-            # wrapper can leave recovery validating against the raw Anthropic
-            # tool_choice (e.g. {"type":"tool", ...}) instead of the internal
-            # OpenAI-shaped choice (e.g. {"function":{"name":...}}).
-            _set_request({"tools": tools, "tool_choice": tool_choice})
+            # Phase-4 runtime has already normalized and seeded the request
+            # context at the Anthropic protocol boundary. Do not overwrite it
+            # here with the raw Anthropic request: that would replace the
+            # canonical OpenAI-shaped tool_choice with {"type":"tool", ...}
+            # immediately before tool-call validation.
             prompt, images = messages_to_prompt(messages, tools, tool_choice)
             if not prompt.strip():
                 raise ValueError("empty prompt")
