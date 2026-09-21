@@ -51,11 +51,13 @@ def main():
     if backend == "modern" and not CONFIG.get("cookie_file"):
         raise SystemExit("Gemini Web authentication cookie is required for the modern backend")
 
-    # Recovery must be installed on the actual public handler because the
-    # hardened handler overrides the streaming/chat boundary. Keep the legacy
-    # base handler covered for compatibility as well.
-    install_phase4_runtime(GeminiHandler)
+    # Install the public hardened handler first.  It inherits the base
+    # Anthropic handler, so installing the base class first would make
+    # _phase4_installed visible through inheritance and cause the hardened
+    # class to skip its own do_POST/recovery wrapper.
     install_phase4_runtime(HardenedGeminiHandler)
+    # Keep the legacy base handler covered for compatibility as well.
+    install_phase4_runtime(GeminiHandler)
     install_observability(HardenedGeminiHandler)
 
     port = int(CONFIG["port"])
