@@ -3,7 +3,7 @@
 
 The maintained implementation lives in the ``gemini_web2api`` package. This
 file is intentionally tiny so the historical command continues to work while
-never starting the retired direct StreamGenerate server.
+delegating all server startup to the maintained package entry point.
 """
 
 from gemini_web2api.__main__ import main

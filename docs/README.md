@@ -1,6 +1,6 @@
-# gemini-web2api documentation
+# GeminiAgentBridge documentation
 
-This directory is the maintained documentation set for the project. The root `README.md` is the quick-start entry point; these pages contain the detailed operational and engineering contracts.
+This directory is the maintained documentation set for GeminiAgentBridge. The root `README.md` is the quick-start entry point; these pages contain the detailed operational and engineering contracts.
 
 ## Start here
 
@@ -15,8 +15,9 @@ This directory is the maintained documentation set for the project. The root `RE
 | [`development.md`](development.md) | Tests, benchmarks, phase gates, and contribution workflow |
 | [`security.md`](security.md) | Credential handling, logging, threat boundaries, and reporting rules |
 | [`live-transport.md`](live-transport.md) | Modern Gemini Web transport, legacy path, session lifecycle, and current repair status |
+| [`RELEASE.md`](RELEASE.md) | One finite final release procedure and Go/No-Go rules |
 | [`release-status.md`](release-status.md) | Current release/go-no-go record |
-| [`phase8-real-client-evidence.md`](phase8-real-client-evidence.md) | Durable Hermes/OpenCode 26/26 evidence |
+| [`phase8-real-client-evidence.md`](phase8-real-client-evidence.md) | Historical Hermes/OpenCode 26/26 evidence |
 
 ## Documentation rules
 
@@ -24,9 +25,10 @@ This directory is the maintained documentation set for the project. The root `RE
 2. A synthetic unit test is not presented as proof of live Gemini Web availability.
 3. A successful bridge HTTP request is not presented as proof that Gemini Web authentication succeeded.
 4. No document contains real cookies, API keys, session files, or authorization headers.
-5. Claims about live client compatibility must identify whether they came from hosted CI or an explicit local real-client run.
+5. Claims about live client compatibility identify whether they came from hosted CI or an explicit local real-client run.
 6. Model names are client-facing aliases, not guarantees of a specific Google deployment.
+7. The six remaining release items are not an expandable roadmap: they terminate at the single final release gate in `docs/RELEASE.md`.
 
 ## Current status
 
-The Phase 13 release candidate was independently verified before the current live-transport repair. The repair branch changes the upstream Gemini Web transport and therefore requires a fresh authenticated live generation gate before it can be considered a released baseline.
+The repository has completed its deterministic release engineering. The current candidate still requires a fresh authenticated Gemini Web generation/stream run and fresh Hermes/OpenCode runs because those depend on the user's private session and installed client versions.

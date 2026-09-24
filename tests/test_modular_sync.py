@@ -155,6 +155,7 @@ class StreamingEndpointTests(unittest.TestCase):
     def setUp(self):
         self.original_config = dict(CONFIG)
         CONFIG["api_keys"] = []
+        CONFIG["upstream_backend"] = "legacy"
         CONFIG["log_requests"] = False
 
     def tearDown(self):
@@ -213,6 +214,117 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(chunks[0]["choices"][0]["delta"], {"role": "assistant"})
         self.assertEqual(chunks[1]["choices"][0]["delta"], {"content": "hel"})
         self.assertEqual(chunks[2]["choices"][0]["delta"], {"content": "lo"})
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.parse_tool_calls")
+    @mock.patch("gemini_web2api.server.generate", return_value="tool output")
+    def test_chat_tool_stream_has_openai_compatible_event_sequence(
+        self, _generate, parse_tool_calls
+    ):
+        parse_tool_calls.return_value = (
+            "",
+            [
+                {
+                    "id": "call_weather",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"Shanghai"}',
+                    },
+                },
+                {
+                    "id": "call_time",
+                    "type": "function",
+                    "function": {
+                        "name": "get_time",
+                        "arguments": '{"city":"Shanghai"}',
+                    },
+                },
+            ],
+        )
+
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "weather and time"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_time",
+                            "description": "Get time",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        },
+                    },
+                ],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+
+        self.assertEqual(len(chunks), 4)
+
+        # 1. Assistant role must be emitted separately.
+        self.assertEqual(
+            chunks[0]["choices"][0]["delta"],
+            {"role": "assistant"},
+        )
+        self.assertIsNone(chunks[0]["choices"][0]["finish_reason"])
+
+        # 2. Each tool call is an explicit OpenAI-compatible delta.
+        first_call = chunks[1]["choices"][0]["delta"]["tool_calls"][0]
+        self.assertEqual(first_call["index"], 0)
+        self.assertEqual(first_call["id"], "call_weather")
+        self.assertEqual(first_call["type"], "function")
+        self.assertEqual(first_call["function"]["name"], "get_weather")
+        self.assertEqual(
+            first_call["function"]["arguments"],
+            '{"city":"Shanghai"}',
+        )
+
+        second_call = chunks[2]["choices"][0]["delta"]["tool_calls"][0]
+        self.assertEqual(second_call["index"], 1)
+        self.assertEqual(second_call["id"], "call_time")
+        self.assertEqual(second_call["type"], "function")
+        self.assertEqual(second_call["function"]["name"], "get_time")
+        self.assertEqual(
+            second_call["function"]["arguments"],
+            '{"city":"Shanghai"}',
+        )
+
+        # 3. Terminal tool_calls finish is a separate chunk.
+        self.assertEqual(chunks[3]["choices"][0]["delta"], {})
+        self.assertEqual(
+            chunks[3]["choices"][0]["finish_reason"],
+            "tool_calls",
+        )
+
+        # 4. The stream terminator is present and follows the finish chunk.
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
     @mock.patch("gemini_web2api.server.generate", return_value="chunked ok")

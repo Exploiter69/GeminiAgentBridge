@@ -1,9 +1,4 @@
-"""Gemini Web transport implementations.
-
-The legacy StreamGenerate implementation remains available for explicit
-compatibility, while the maintained gemini-webapi transport is the default for
-live Gemini Web traffic.
-"""
+"""Gemini Web transport implementations."""
 import json
 import time
 import uuid
@@ -20,17 +15,21 @@ try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
+    httpx = None
     HAS_HTTPX = False
 
+from .backend import BackendFile, BackendRequest
 from .config import CONFIG
 from .performance import RetryPolicy
-from .modern import ModernBackendUnavailable, generate as modern_generate, generate_stream as modern_generate_stream
+from .backend_selection import effective_backend
+from .modern import generate_response as modern_generate_response, generate_stream as modern_generate_stream
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _cookie_lock = threading.Lock()
 _httpx_client = None
 _httpx_client_lock = threading.Lock()
+
 
 
 def log(msg: str):
@@ -59,7 +58,6 @@ def _get_httpx_client():
 
 
 def _reset_httpx_client() -> None:
-    """Drop a stale transport so the next request creates a fresh client."""
     global _httpx_client
     with _httpx_client_lock:
         client, _httpx_client = _httpx_client, None
@@ -71,7 +69,7 @@ def _reset_httpx_client() -> None:
 
 
 def load_cookie() -> tuple:
-    """Load cookie from file with mtime-based caching."""
+    """Load cookie from file with mtime-based caching without logging values."""
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
@@ -80,20 +78,24 @@ def load_cookie() -> tuple:
             mtime = os.path.getmtime(cookie_file)
             if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
                 return _cookie_cache["str"], _cookie_cache["sapisid"]
-            with open(cookie_file, "r") as f:
+            with open(cookie_file, "r", encoding="utf-8") as f:
                 content = f.read().strip()
             if content.startswith("{"):
                 data = json.loads(content)
                 cookie_str = data.get("cookie", "")
                 sapisid = data.get("sapisid", "")
+                if not cookie_str:
+                    pairs = data
+                    cookie_str = "; ".join(f"{k}={v}" for k, v in pairs.items() if isinstance(v, str))
+                    sapisid = data.get("SAPISID", "")
             else:
                 cookie_str = content
                 pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
                 sapisid = pairs.get("SAPISID", "")
             _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
             return cookie_str, sapisid if sapisid else None
-        except Exception as e:
-            log(f"Cookie load error: {e}")
+        except Exception:
+            log("Cookie load error: authentication material could not be parsed")
             return _cookie_cache["str"], _cookie_cache["sapisid"]
 
 
@@ -104,7 +106,6 @@ def make_sapisidhash(sapisid: str) -> str:
 
 
 def _account_prefix() -> str:
-    """Return the Gemini account path prefix for non-default Google accounts."""
     auth_user = CONFIG.get("auth_user")
     if auth_user is None or auth_user == "":
         return ""
@@ -131,7 +132,6 @@ def _build_headers() -> dict:
 
 
 def _apply_chat_persistence_flags(inner: list) -> None:
-    """Apply Gemini Web persistence flags to an outgoing request payload."""
     if CONFIG.get("temporary_chats", False):
         inner[41] = [1]
         inner[45] = 1
@@ -183,16 +183,12 @@ def _get_url() -> str:
 
 
 def clean_text(text: str, strip: bool = True) -> str:
-    text = re.sub(
-        r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
-        '', text, flags=re.DOTALL
-    )
+    text = re.sub(r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?', '', text, flags=re.DOTALL)
     text = re.sub(r'http://googleusercontent\.com/card_content/\d+\n?', '', text)
     return text.strip() if strip else text
 
 
 def _extract_texts_from_line(line: str) -> list:
-    """Parse a single wrb.fr line and return list of text strings found."""
     if '"wrb.fr"' not in line or len(line) < 200:
         return []
     try:
@@ -215,7 +211,6 @@ def _extract_texts_from_line(line: str) -> list:
 
 
 def extract_response_text(raw: str) -> str:
-    """Parse full response to get final text."""
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
@@ -239,9 +234,11 @@ def _retry_policy() -> RetryPolicy:
 
 
 def _is_retryable_error(error: Exception) -> bool:
-    """Avoid repeating deterministic upstream rejections while retrying transient failures."""
+    # A provider rate limit is not a transient transport failure. Retrying
+    # immediately amplifies the rate limit and can make downstream agents
+    # retry the same request repeatedly. Preserve 429 for the API boundary.
     if isinstance(error, urllib.error.HTTPError):
-        return error.code in {408, 425, 429} or 500 <= error.code <= 599
+        return error.code in {408, 425} or 500 <= error.code <= 599
     if isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
         return True
     if HAS_HTTPX and isinstance(error, httpx.TransportError):
@@ -249,37 +246,41 @@ def _is_retryable_error(error: Exception) -> bool:
     message = str(error)
     if message.startswith("Gemini upstream rejected request:"):
         return False
-    return message in {
-        "Gemini upstream returned an empty response",
-        "Gemini stream content changed during retry",
-    }
+    return message in {"Gemini upstream returned an empty response", "Gemini stream content changed during retry"}
 
 
 def _sleep_before_retry(policy: RetryPolicy, attempt: int, error: Exception) -> None:
     delay = policy.delay_for_retry(attempt)
-    log(f"Retry {attempt + 1}/{policy.attempts}: {error}; sleeping {delay:g}s")
+    log(f"Retry {attempt + 1}/{policy.attempts}: {type(error).__name__}; sleeping {delay:g}s")
     if delay:
         time.sleep(delay)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Generate using the configured live transport, or the legacy transport explicitly."""
-    backend = str(CONFIG.get("upstream_backend", "modern")).lower()
-    if backend != "legacy":
-        try:
-            return modern_generate(prompt, model_id)
-        except ModernBackendUnavailable:
-            if backend == "modern":
-                raise
-            log("Modern Gemini transport unavailable; falling back to legacy transport")
+def _legacy_file_refs(files: tuple) -> list[str]:
+    if not files:
+        return []
+    from .multimodal import upload_image
+    refs = []
+    for item in files:
+        data = getattr(item, "data", None)
+        filename = getattr(item, "filename", "attachment.bin")
+        mime_type = getattr(item, "mime_type", "application/octet-stream")
+        if data is None:
+            raise ValueError("legacy backend requires file bytes for each attachment")
+        refs.append(upload_image(data, filename, mime_type))
+    return refs
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+
+def _generate_legacy(request: BackendRequest) -> str:
+    if not isinstance(request.model, int):
+        raise ValueError("legacy backend requires a resolved numeric model mode")
+    file_refs = _legacy_file_refs(request.files)
+    body = _build_payload(request.prompt, request.model, request.think_mode or 0, file_refs, request.provider_options).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
     policy = _retry_policy()
-
     last_err = None
     for attempt in range(policy.attempts):
         try:
@@ -305,29 +306,61 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Stream using the configured live transport, or the legacy transport explicitly."""
-    backend = str(CONFIG.get("upstream_backend", "modern")).lower()
-    if backend != "legacy":
-        try:
-            yield from modern_generate_stream(prompt, model_id)
-            return
-        except ModernBackendUnavailable:
-            if backend == "modern":
-                raise
-            log("Modern Gemini transport unavailable; falling back to legacy transport")
+def generate(prompt: str, model_id, think_mode=None, file_refs=None, extra_fields=None) -> str:
+    """Generate while preserving every normalized request field."""
+    configured_backend = str(CONFIG.get("upstream_backend", "modern")).lower()
+    backend = effective_backend(configured_backend, CONFIG.get("cookie_file"))
+    request = BackendRequest.from_legacy_args(
+        prompt,
+        model_id,
+        files=file_refs,
+        think_mode=think_mode,
+        temporary=bool(CONFIG.get("temporary_chats", False)),
+        provider_options=extra_fields,
+    )
+    if backend == "legacy":
+        return _generate_legacy(request)
+    if backend == "modern":
+        return modern_generate_response(request).text
+    raise ValueError(f"unsupported upstream_backend: {backend}")
 
+
+def generate_stream(prompt: str, model_id, think_mode=None, file_refs=None, extra_fields=None):
+    """Stream while preserving files/model/temporary/options across transports."""
+    configured_backend = str(CONFIG.get("upstream_backend", "modern")).lower()
+    backend = effective_backend(configured_backend, CONFIG.get("cookie_file"))
+    request = BackendRequest.from_legacy_args(
+        prompt,
+        model_id,
+        stream=True,
+        files=file_refs,
+        think_mode=think_mode,
+        temporary=bool(CONFIG.get("temporary_chats", False)),
+        provider_options=extra_fields,
+    )
+    if backend == "legacy":
+        yield from _legacy_stream(request)
+        return
+    if backend == "modern":
+        yield from modern_generate_stream(request)
+        return
+    raise ValueError(f"unsupported upstream_backend: {backend}")
+
+
+def _legacy_stream(request: BackendRequest):
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text = _generate_legacy(request)
         if text:
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+    if not isinstance(request.model, int):
+        raise ValueError("legacy backend requires a resolved numeric model mode")
+    file_refs = _legacy_file_refs(request.files)
+    body = _build_payload(request.prompt, request.model, request.think_mode or 0, file_refs, request.provider_options)
     url = _get_url()
     headers = _build_headers()
     policy = _retry_policy()
-
     last_err = None
     emitted_raw_text = ""
     for attempt in range(policy.attempts):
@@ -341,9 +374,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     if "BardErrorInfo" in buf:
                         bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                         if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
+                            raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
@@ -360,7 +391,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             last_err = e
             if attempt >= policy.attempts - 1 or not _is_retryable_error(e):
                 break
-            if HAS_HTTPX and isinstance(e, httpx.TransportError):
+            if HAS_HTTPX and httpx is not None and isinstance(e, httpx.TransportError):
                 _reset_httpx_client()
             _sleep_before_retry(policy, attempt, e)
     raise last_err

@@ -52,6 +52,7 @@ class Phase3AgentContractTests(unittest.TestCase):
     def setUp_server(self):
         original_config = dict(CONFIG)
         CONFIG["api_keys"] = []
+        CONFIG["upstream_backend"] = "legacy"
         bridge = server.ThreadedServer(("127.0.0.1", 0), server.GeminiHandler)
         thread = threading.Thread(target=bridge.serve_forever, daemon=True)
         thread.start()
@@ -128,6 +129,103 @@ class Phase3AgentContractTests(unittest.TestCase):
         finally:
             self.tearDown_server()
 
+    def test_responses_api_resolves_tool_name_when_function_call_output_omits_name(self):
+        # Regression: the real OpenAI Responses API schema for
+        # "function_call_output" carries only {type, call_id, output} - it
+        # has NO "name" field (unlike this test file's other fixtures, which
+        # add "name" defensively). The bridge must still resolve the tool
+        # name via call_id -> the preceding function_call's name, the same
+        # mechanism that fixes this for Chat Completions tool messages.
+        self.setUp_server()
+        try:
+            first = '```tool_call\n{"name":"read_file","arguments":{"path":"app.py"}}\n```'
+            with mock.patch("gemini_web2api.server.generate", return_value=first):
+                status, body = self._call("/v1/responses", {
+                    "model": "gemini-3.1-pro",
+                    "input": [{"type": "input_text", "text": "Read app.py"}],
+                    "tools": [{"type": "function", "name": "read_file", "parameters": self.tools[0]["function"]["parameters"]}],
+                })
+            self.assertEqual(status, 200)
+            call = next(item for item in body["output"] if item["type"] == "function_call")
+
+            # Realistic Responses API shape: no "name" on function_call_output.
+            output = [
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "function_call", "call_id": call["call_id"], "name": "read_file", "arguments": call["arguments"]}
+                ]},
+                {"type": "function_call_output", "call_id": call["call_id"], "output": "print('ok')"},
+            ]
+            with mock.patch("gemini_web2api.server.generate", return_value="The file contains print('ok').") as upstream:
+                status, body2 = self._call("/v1/responses", {
+                    "model": "gemini-3.1-pro",
+                    "input": output,
+                    "tools": [{"type": "function", "name": "read_file", "parameters": self.tools[0]["function"]["parameters"]}],
+                })
+            self.assertEqual(status, 200)
+            prompt = upstream.call_args.args[0]
+            self.assertIn("Tool result for read_file", prompt)
+            self.assertNotIn("Tool result for ]", prompt)
+            self.assertNotIn("Tool result for :", prompt)
+        finally:
+            self.tearDown_server()
+
+    def test_responses_api_preserves_top_level_function_call_input(self):
+        self.setUp_server()
+        try:
+            with mock.patch(
+                "gemini_web2api.server.generate",
+                return_value="Tool result acknowledged.",
+            ) as upstream:
+                status, body = self._call("/v1/responses", {
+                    "model": "gemini-3.1-pro",
+                    "input": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_read",
+                            "name": "read_file",
+                            "arguments": '{"path":"app.py"}',
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_read",
+                            "name": "read_file",
+                            "output": "print('ok')",
+                        },
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read_file",
+                            "parameters": self.tools[0]["function"]["parameters"],
+                        }
+                    ],
+                })
+
+            self.assertEqual(status, 200)
+            prompt = upstream.call_args.args[0]
+
+            # The prior function call must survive as an assistant tool call.
+            self.assertIn("[Assistant]:", prompt)
+            self.assertIn('"name": "read_file"', prompt)
+            self.assertIn('"path":"app.py"', prompt)
+            self.assertIn("Tool result for read_file", prompt)
+            self.assertIn("print('ok')", prompt)
+
+            # The corresponding observation must remain a tool result.
+            self.assertIn("Tool result for read_file", prompt)
+            self.assertIn("print('ok')", prompt)
+
+            self.assertEqual(
+                body["output"][0]["type"],
+                "message",
+            )
+            self.assertIn(
+                "Tool result acknowledged.",
+                body["output"][0]["content"][0]["text"],
+            )
+        finally:
+            self.tearDown_server()
+
     def test_tool_messages_are_not_lost_when_no_tools_are_requested(self):
         prompt, _ = tools.messages_to_prompt([
             {"role": "user", "content": "hello"},
@@ -135,6 +233,38 @@ class Phase3AgentContractTests(unittest.TestCase):
         ], None, "none")
         self.assertIn("Tool result for bash", prompt)
         self.assertIn("/home/user/project", prompt)
+
+    def test_tool_result_name_is_resolved_from_tool_call_id_when_name_is_absent(self):
+        # Regression: a standard OpenAI Chat Completions tool-result message
+        # carries "tool_call_id", not "name" ("name" belongs to the deprecated
+        # function-role message shape). Real clients such as OpenCode send
+        # exactly this shape. Before this fix, messages_to_prompt rendered
+        # every such result as an anonymous "[Tool result for ]" block,
+        # making concurrent/sequential tool calls indistinguishable to the
+        # model as soon as more than one tool call appeared in a trajectory.
+        prompt, _ = tools.messages_to_prompt([
+            {"role": "user", "content": "list *.py then read the first one"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "glob", "arguments": '{"pattern": "*.py"}'}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "a.py\nb.py"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_2", "content": "print(1)"},
+        ], None, "auto")
+        self.assertIn("Tool result for glob", prompt)
+        self.assertIn("Tool result for read_file", prompt)
+        self.assertNotIn("Tool result for ]", prompt)
+        self.assertNotIn("Tool result for :", prompt)
 
     def test_tool_context_is_reset_by_each_prompt_build(self):
         protocol.set_tool_context(self.tools, "required")

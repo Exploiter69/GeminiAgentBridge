@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -27,25 +28,23 @@ if str(ROOT) not in sys.path:
 from gemini_web2api.client_compat import COMPATIBILITY_MATRIX
 from gemini_web2api.config import CONFIG
 from gemini_web2api.hardened_server import HardenedGeminiHandler, HardenedThreadedServer
+from gemini_web2api.phase4_runtime import install_phase4_runtime
+from gemini_web2api.runtime_observability import install_observability
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 
 MODEL = "gemini-3.6-flash"
 
 
 def _tools(prompt: str) -> list[dict]:
-    marker = "Available tools:\n"
-    pos = prompt.find(marker)
-    if pos < 0:
-        return []
+    marker = "Available tools:\n"; pos = prompt.find(marker)
+    if pos < 0: return []
     try:
         value, _ = json.JSONDecoder().raw_decode(prompt[pos + len(marker):].lstrip())
         return value if isinstance(value, list) else []
-    except (json.JSONDecodeError, TypeError):
-        return []
+    except (json.JSONDecodeError, TypeError): return []
 
 
-def _schema(tool: dict) -> tuple[str, dict]:
-    return str(tool.get("name", "")), tool.get("parameters") or {}
+def _schema(tool: dict) -> tuple[str, dict]: return str(tool.get("name", "")), tool.get("parameters") or {}
 
 
 def _pick(tools: list[dict], kind: str) -> tuple[str, dict] | None:
@@ -55,10 +54,8 @@ def _pick(tools: list[dict], kind: str) -> tuple[str, dict] | None:
         "search": ("search_files", "search", "grep", "glob"), "terminal": ("terminal", "bash", "shell", "run_command", "command"),
     }
     for tool in tools:
-        name, schema = _schema(tool)
-        low = name.lower()
-        if low in aliases[kind] or any(alias in low for alias in aliases[kind]):
-            return name, schema
+        name, schema = _schema(tool); low = name.lower()
+        if low in aliases[kind] or any(alias in low for alias in aliases[kind]): return name, schema
     return None
 
 
@@ -80,8 +77,7 @@ def _value(key: str, prompt: str) -> object:
 
 
 def _args(schema: dict, prompt: str) -> dict:
-    props = schema.get("properties") or {}
-    out = {}
+    props = schema.get("properties") or {}; out = {}
     for key in schema.get("required", []) or []:
         value = _value(str(key), prompt)
         if value is not None: out[key] = value
@@ -93,8 +89,7 @@ def _args(schema: dict, prompt: str) -> dict:
 
 
 def _marker(prompt: str) -> str:
-    match = re.search(r"reply exactly (PHASE8_[A-Z0-9_]+)", prompt)
-    return match.group(1) if match else "PHASE8_OK"
+    match = re.search(r"reply exactly (PHASE8_[A-Z0-9_]+)", prompt); return match.group(1) if match else "PHASE8_OK"
 
 
 def _stub(prompt: str, *args, **kwargs) -> str:
@@ -118,16 +113,15 @@ def _stub(prompt: str, *args, **kwargs) -> str:
     return "```tool_call\n" + json.dumps({"name": name, "arguments": _args(schema, prompt)}) + "\n```"
 
 
-def _bridge(live: bool, cookie_file: str | None):
-    CONFIG["api_keys"] = []
-    CONFIG["log_requests"] = False
+def _bridge(live: bool, cookie_file: str | None, backend: str):
+    CONFIG["api_keys"] = []; CONFIG["log_requests"] = False
+    install_phase4_runtime(GeminiHandler)
+    install_phase4_runtime(HardenedGeminiHandler)
+    install_observability(HardenedGeminiHandler)
     if live:
-        if not cookie_file or not os.path.isfile(cookie_file):
-            raise RuntimeError("--live requires an existing --cookie-file")
-        CONFIG["upstream_backend"] = "modern"
-        CONFIG["cookie_file"] = cookie_file
-        server = HardenedThreadedServer(("127.0.0.1", 0), HardenedGeminiHandler)
-        patches = []
+        if not cookie_file or not os.path.isfile(cookie_file): raise RuntimeError("--live requires an existing --cookie-file")
+        CONFIG["upstream_backend"] = backend; CONFIG["cookie_file"] = cookie_file
+        server = HardenedThreadedServer(("127.0.0.1", 0), HardenedGeminiHandler); patches = []
     else:
         server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
         patches = [
@@ -135,89 +129,105 @@ def _bridge(live: bool, cookie_file: str | None):
             mock.patch("gemini_web2api.server.generate_stream", side_effect=lambda prompt, *a, **kw: iter([_stub(prompt, *a, **kw)])),
         ]
         for patcher in patches: patcher.start()
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     return server, thread, patches
 
 
-def _hermes_env(root: Path, port: int) -> dict[str, str]:
-    home = root / "hermes-home"
-    home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(
-        f"model:\n  default: {MODEL}\n  provider: custom\n  base_url: http://127.0.0.1:{port}/v1\n  api_key: phase8-test\n"
-        "terminal:\n  backend: local\n  home_mode: profile\nagent:\n  max_turns: 8\n", encoding="utf-8")
-    env = os.environ.copy(); env["HERMES_HOME"] = str(home)
-    env.pop("OPENAI_API_KEY", None); env.pop("OPENAI_BASE_URL", None)
-    return env
+def _hermes_env(root: Path, port: int, model: str) -> dict[str, str]:
+    home = root / "hermes-home"; home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(f"model:\n  default: {model}\n  provider: custom\n  base_url: http://127.0.0.1:{port}/v1\n  api_key: phase8-test\nterminal:\n  backend: local\n  home_mode: profile\nagent:\n  max_turns: 12\n", encoding="utf-8")
+    env = os.environ.copy(); env["HERMES_HOME"] = str(home); env.pop("OPENAI_API_KEY", None); env.pop("OPENAI_BASE_URL", None); return env
 
 
-def _opencode_config(workspace: Path, port: int) -> Path:
-    config = {
-        "$schema": "https://opencode.ai/config.json", "model": f"phase8/{MODEL}",
-        "provider": {"phase8": {"npm": "@ai-sdk/openai-compatible", "name": "Phase 8 Bridge Test",
-            "options": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": "phase8-test"},
-            "models": {MODEL: {"name": MODEL, "limit": {"context": 128000, "output": 8192}}}}},
-    }
+def _opencode_config(workspace: Path, port: int, model: str) -> Path:
+    config = {"$schema": "https://opencode.ai/config.json", "model": f"phase8/{model}", "provider": {"phase8": {"npm": "@ai-sdk/openai-compatible", "name": "Phase 8 Bridge Test", "options": {"baseURL": f"http://127.0.0.1:{port}/v1", "apiKey": "phase8-test"}, "models": {model: {"name": model, "limit": {"context": 128000, "output": 8192}}}}}}
     path = workspace / "opencode-phase8.json"; path.write_text(json.dumps(config, indent=2), encoding="utf-8"); return path
 
 
-def _run(name: str, prompt: str, workspace: Path, root: Path, port: int) -> dict:
+def _run(name: str, prompt: str, workspace: Path, root: Path, port: int, model: str) -> dict:
     if name == "hermes":
-        env = _hermes_env(root, port)
-        cmd = ["hermes", "-z", prompt, "-m", MODEL, "-t", "file,terminal"]
+        env = _hermes_env(root, port, model); cmd = ["hermes", "-z", prompt, "-m", model, "-t", "file,terminal"]
     else:
         env = os.environ.copy(); env.pop("OPENAI_API_KEY", None); env.pop("OPENAI_BASE_URL", None)
-        env_home = root / "opencode-home"; env_home.mkdir(parents=True, exist_ok=True)
-        env["HOME"] = str(env_home); env["XDG_CONFIG_HOME"] = str(env_home / ".config")
-        env["OPENCODE_CONFIG"] = str(_opencode_config(workspace, port))
-        cmd = ["opencode", "run", "--print-logs", "--log-level", "DEBUG", "--auto", "--model", f"phase8/{MODEL}", prompt]
-    proc = subprocess.run(cmd, cwd=workspace, env=env, text=True, capture_output=True, timeout=180)
+        env_home = root / "opencode-home"; env_home.mkdir(parents=True, exist_ok=True); env["HOME"] = str(env_home); env["XDG_CONFIG_HOME"] = str(env_home / ".config"); env["OPENCODE_CONFIG"] = str(_opencode_config(workspace, port, model))
+        cmd = ["opencode", "run", "--print-logs", "--log-level", "DEBUG", "--auto", "--model", f"phase8/{model}", prompt]
+    proc = subprocess.run(cmd, cwd=workspace, env=env, text=True, capture_output=True, timeout=300)
     output = (proc.stdout + "\n" + proc.stderr).strip(); marker = _marker(prompt)
     return {"returncode": proc.returncode, "passed": proc.returncode == 0 and marker in output, "marker": marker, "output_tail": output[-2500:]}
 
 
 def _workspace(root: Path, case) -> Path:
-    path = root / case.name; path.mkdir(parents=True, exist_ok=True)
-    (path / "sample.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
-    (path / "README.md").write_text("phase8 fixture\n", encoding="utf-8")
+    path = root / case.name; path.mkdir(parents=True, exist_ok=True); (path / "sample.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8"); (path / "README.md").write_text("phase8 fixture\n", encoding="utf-8")
     if case.name in {"git_status", "git_diff"}:
-        subprocess.run(["git", "init", "-q"], cwd=path, check=True)
-        subprocess.run(["git", "add", "sample.txt", "README.md"], cwd=path, check=True)
-        subprocess.run(["git", "-c", "user.name=Phase8", "-c", "user.email=phase8@example.invalid", "commit", "-qm", "fixture"], cwd=path, check=True)
+        subprocess.run(["git", "init", "-q"], cwd=path, check=True); subprocess.run(["git", "add", "sample.txt", "README.md"], cwd=path, check=True); subprocess.run(["git", "-c", "user.name=Phase8", "-c", "user.email=phase8@example.invalid", "commit", "-qm", "fixture"], cwd=path, check=True)
     return path
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--hermes", action="store_true")
-    parser.add_argument("--opencode", action="store_true")
-    parser.add_argument("--live", action="store_true", help="Use real Gemini Web instead of the deterministic stub")
-    parser.add_argument("--cookie-file", type=str, default=None, help="Gemini cookie file used only with --live")
-    args = parser.parse_args()
-    clients = [name for name, enabled in (("hermes", args.hermes), ("opencode", args.opencode)) if enabled]
+    parser = argparse.ArgumentParser(); parser.add_argument("--hermes", action="store_true"); parser.add_argument("--opencode", action="store_true"); parser.add_argument("--live", action="store_true"); parser.add_argument("--cookie-file", type=str, default=None); parser.add_argument("--model", type=str, default=MODEL); parser.add_argument("--backend", choices=("legacy", "modern", "auto"), default="legacy"); parser.add_argument("--live-delay", type=float, default=2.0, help="Delay between live compatibility cases")
+    args = parser.parse_args(); clients = [name for name, enabled in (("hermes", args.hermes), ("opencode", args.opencode)) if enabled]
     if not clients:
         print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "real_clients": "not requested", "self_check": True}, indent=2)); return 0
     original = dict(CONFIG)
     with tempfile.TemporaryDirectory(prefix="gemini-agent-bridge-phase8-") as td:
-        root = Path(td); server, thread, patches = _bridge(args.live, args.cookie_file); port = server.server_address[1]; results = {}
+        root = Path(td); server, thread, patches = _bridge(args.live, args.cookie_file, args.backend); port = server.server_address[1]; results = {}
         try:
             for client in clients:
-                if not shutil.which(client):
-                    results[client] = {"passed": False, "error": "client not installed"}; continue
+                if not shutil.which(client): results[client] = {"passed": False, "error": "client not installed"}; continue
                 cases = {}; client_root = root / client; client_root.mkdir()
-                for case in COMPATIBILITY_MATRIX:
-                    workspace = _workspace(client_root, case)
-                    prompt = f"{case.prompt} After actually completing the task, reply exactly PHASE8_{case.name.upper()}_OK."
-                    try: cases[case.name] = _run(client, prompt, workspace, root, port)
-                    except subprocess.TimeoutExpired: cases[case.name] = {"passed": False, "error": "client timed out"}
-                results[client] = {"cases": len(cases), "passed_cases": sum(1 for result in cases.values() if result.get("passed")), "all_pass": all(result.get("passed") for result in cases.values()), "details": cases}
-            print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "clients": results, "mode": "live" if args.live else "stub"}, indent=2))
-            return 0 if all(result.get("all_pass") for result in results.values()) else 1
+                infrastructure_error = None
+                for case_index, case in enumerate(COMPATIBILITY_MATRIX):
+                    if args.live and case_index:
+                        time.sleep(max(0.0, args.live_delay))
+
+                    workspace = _workspace(client_root, case); prompt = f"{case.prompt} After actually completing the task, reply exactly PHASE8_{case.name.upper()}_OK."
+                    try:
+                        case_result = _run(client, prompt, workspace, root, port, args.model)
+                        cases[case.name] = case_result
+
+                        # A provider-side rate limit or transport outage is an
+                        # infrastructure condition, not a client compatibility
+                        # failure. Stop the live matrix rather than amplifying
+                        # the upstream failure with more requests.
+                        diagnostic = str(case_result).lower()
+                        if (
+                            "429" in diagnostic
+                            or "too many requests" in diagnostic
+                            or "rate_limit" in diagnostic
+                            or "rate limit" in diagnostic
+                            or "upstream request failed" in diagnostic
+                            or "ai_retryerror" in diagnostic
+                        ):
+                            infrastructure_error = "upstream rate-limit/transport failure"
+                            print(
+                                f"PHASE8_INFRASTRUCTURE_STOP: {client} "
+                                f"{case.name}: {infrastructure_error}",
+                                flush=True,
+                            )
+                            break
+
+                    except subprocess.TimeoutExpired:
+                        cases[case.name] = {"passed": False, "error": "client timed out"}
+
+                results[client] = {
+                    "cases": len(cases),
+                    "passed_cases": sum(
+                        1 for result in cases.values()
+                        if result.get("passed")
+                    ),
+                    "all_pass": (
+                        infrastructure_error is None
+                        and len(cases) == len(COMPATIBILITY_MATRIX)
+                        and all(result.get("passed") for result in cases.values())
+                    ),
+                    "infrastructure_error": infrastructure_error,
+                    "details": cases,
+                }
+            print(json.dumps({"matrix_cases": len(COMPATIBILITY_MATRIX), "clients": results, "mode": "live" if args.live else "stub", "model": args.model}, indent=2)); return 0 if all(result.get("all_pass") for result in results.values()) else 1
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=5)
             for patcher in patches: patcher.stop()
             CONFIG.clear(); CONFIG.update(original)
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == "__main__": raise SystemExit(main())
