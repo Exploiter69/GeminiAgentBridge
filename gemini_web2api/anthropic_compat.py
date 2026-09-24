@@ -7,7 +7,10 @@ It does not execute client tools.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
+
+from .protocol import validate_tool_choice
 
 
 def _text_blocks(content: Any) -> str:
@@ -67,8 +70,6 @@ def anthropic_tools_to_openai(tools: Any) -> list[dict]:
             raise ValueError(f"unsupported Anthropic tool at index {index}")
         tool_type = tool.get("type")
         if tool_type not in (None, "custom"):
-            # Never silently drop a client tool: Claude Code's agent loop
-            # depends on the bridge preserving the complete tool universe.
             raise ValueError(f"unsupported Anthropic tool type: {tool_type!r}")
         name = tool.get("name")
         if not isinstance(name, str) or not name.strip():
@@ -103,14 +104,65 @@ def anthropic_tool_choice_to_openai(choice: Any) -> Any:
     raise ValueError("unsupported Anthropic tool_choice")
 
 
+def _validate_anthropic_tool_trajectory(messages: Any) -> None:
+    """Validate client-supplied tool blocks before sending them upstream.
+
+    The bridge cannot execute tools, so malformed tool_result blocks must never
+    be converted into anonymous tool messages and silently accepted. Likewise,
+    a result must reference a tool_use ID that exists in the supplied
+    conversation history.
+    """
+    tool_use_ids: set[str] = set()
+    for message_index, message in enumerate(messages or []):
+        if not isinstance(message, dict):
+            raise ValueError(f"message at index {message_index} must be an object")
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            continue
+        for block_index, block in enumerate(content):
+            if not isinstance(block, dict):
+                raise ValueError(
+                    f"message content block at index {message_index}:{block_index} must be an object"
+                )
+            kind = block.get("type")
+            if kind == "tool_use":
+                tool_id = block.get("id")
+                name = block.get("name")
+                if not isinstance(tool_id, str) or not tool_id.strip():
+                    raise ValueError(
+                        f"tool_use at message {message_index} is missing an id"
+                    )
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(
+                        f"tool_use at message {message_index} is missing a name"
+                    )
+                if tool_id in tool_use_ids:
+                    raise ValueError(f"duplicate tool_use id {tool_id!r}")
+                tool_use_ids.add(tool_id)
+            elif kind == "tool_result":
+                tool_id = block.get("tool_use_id")
+                if not isinstance(tool_id, str) or not tool_id.strip():
+                    raise ValueError(
+                        f"tool_result at message {message_index} is missing tool_use_id"
+                    )
+                if tool_id not in tool_use_ids:
+                    raise ValueError(
+                        f"tool_result references unknown tool_use_id {tool_id!r}"
+                    )
+
+
 def anthropic_messages_to_openai(req: dict[str, Any]) -> tuple[list[dict], list[dict], Any]:
-    messages = []
+    messages = req.get("messages", [])
+    _validate_anthropic_tool_trajectory(messages)
+
+    converted_messages = []
     system = req.get("system")
     if system:
-        messages.append({"role": "system", "content": _text_blocks(system)})
+        converted_messages.append({"role": "system", "content": _text_blocks(system)})
 
-    for message in req.get("messages", []):
+    for message in messages:
         if not isinstance(message, dict):
+            # _validate_anthropic_tool_trajectory has already rejected this.
             continue
         role = message.get("role")
         content = message.get("content", "")
@@ -121,17 +173,17 @@ def anthropic_messages_to_openai(req: dict[str, Any]) -> tuple[list[dict], list[
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         tool_calls.append({
-                            "id": block.get("id", ""),
+                            "id": block["id"],
                             "type": "function",
                             "function": {
-                                "name": block.get("name", ""),
-                                "arguments": __import__("json").dumps(block.get("input", {}), ensure_ascii=False),
+                                "name": block["name"],
+                                "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
                             },
                         })
             item = {"role": "assistant", "content": text if text else None}
             if tool_calls:
                 item["tool_calls"] = tool_calls
-            messages.append(item)
+            converted_messages.append(item)
         elif role == "user" and isinstance(content, list) and any(
             isinstance(b, dict) and b.get("type") == "tool_result" for b in content
         ):
@@ -142,21 +194,24 @@ def anthropic_messages_to_openai(req: dict[str, Any]) -> tuple[list[dict], list[
                     value = block.get("content", "")
                     if isinstance(value, list):
                         value = _text_blocks(value)
-                    messages.append({
+                    converted_messages.append({
                         "role": "tool",
-                        "tool_call_id": block.get("tool_use_id", ""),
+                        "tool_call_id": block["tool_use_id"],
                         "content": str(value),
                     })
                 elif block.get("type") in ("text", "image"):
-                    # Preserve additional user content in the same turn.
                     converted = _anthropic_content_to_openai([block])
                     if converted:
-                        messages.append({"role": "user", "content": converted})
+                        converted_messages.append({"role": "user", "content": converted})
         else:
-            messages.append({"role": role or "user", "content": _anthropic_content_to_openai(content)})
+            converted_messages.append({"role": role or "user", "content": _anthropic_content_to_openai(content)})
 
     tools = anthropic_tools_to_openai(req.get("tools"))
-    return messages, tools, anthropic_tool_choice_to_openai(req.get("tool_choice"))
+    choice = anthropic_tool_choice_to_openai(req.get("tool_choice"))
+    choice_errors = validate_tool_choice(choice, tools)
+    if choice_errors:
+        raise ValueError("invalid Anthropic tool_choice: " + "; ".join(choice_errors))
+    return converted_messages, tools, choice
 
 
 def anthropic_response(
@@ -171,7 +226,6 @@ def anthropic_response(
         content.append({"type": "text", "text": text})
     for call in tool_calls or []:
         fn = call.get("function", {})
-        import json
         try:
             tool_input = json.loads(fn.get("arguments", "{}"))
         except (TypeError, ValueError):
