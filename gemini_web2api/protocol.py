@@ -147,9 +147,9 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
         name, arguments = normalized
         canonical = json.dumps({"name": name, "arguments": arguments}, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         spans.append((start, end))
-        # Preserve every emitted call. Exact duplicates can be intentional
-        # (especially for side-effecting tools); transport must not invent a
-        # deduplication policy on behalf of the agent runtime.
+        if canonical in seen:
+            continue
+        seen.add(canonical)
         digest = hashlib.sha256(f"{len(calls)}:{canonical}".encode()).hexdigest()[:12]
         calls.append({"id": f"call_{digest}", "type": "function", "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))}})
     if not spans:
