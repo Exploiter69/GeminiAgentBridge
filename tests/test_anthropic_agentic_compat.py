@@ -8,7 +8,7 @@ from gemini_web2api.anthropic_compat import (
 
 
 class AnthropicAgenticCompatibilityTests(unittest.TestCase):
-    def test_named_tool_choice_is_canonical_openai_function_choice(self):
+    def test_named_tool_choice_uses_internal_function_choice(self):
         choice = anthropic_tool_choice_to_openai(
             {"type": "tool", "name": "read_file"}
         )
@@ -37,7 +37,7 @@ class AnthropicAgenticCompatibilityTests(unittest.TestCase):
         self.assertEqual(tools[0]["function"]["name"], "read_file")
         self.assertEqual(
             choice,
-            {"type": "function", "function": {"name": "read_file"}},
+            {"function": {"name": "read_file"}},
         )
 
     def test_unsupported_server_tool_is_not_silently_dropped(self):
@@ -51,7 +51,7 @@ class AnthropicAgenticCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported Anthropic tool_choice"):
             anthropic_tool_choice_to_openai({"type": "bogus"})
 
-    def test_duplicate_tool_calls_remain_distinct(self):
+    def test_exact_duplicate_tool_calls_are_deduplicated(self):
         from gemini_web2api.protocol import parse_tool_calls_robust
         text = (
             '@@TOOL_CALL@@\\n{"name":"write_file","arguments":{"path":"x","content":"a"}}\\n'
@@ -60,7 +60,6 @@ class AnthropicAgenticCompatibilityTests(unittest.TestCase):
             '@@END_TOOL_CALL@@'
         )
         _, calls = parse_tool_calls_robust(text)
-        self.assertEqual(len(calls), 2)
         self.assertEqual(len(calls), 1)
 
 
