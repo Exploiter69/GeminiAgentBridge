@@ -100,3 +100,121 @@ def test_hardened_handler_dispatches_anthropic_messages():
     HardenedGeminiHandler.do_POST(handler)
 
     assert calls == [b'{"messages":[{"role":"user","content":"hello"}]}']
+
+
+def test_production_anthropic_tool_choice_survives_phase4_runtime():
+    """Exercise the same base+Hardened installation used by __main__.
+
+    The important contract is that an Anthropic named tool choice is
+    normalized before Phase-6 validation and remains canonical all the way
+    through the production handler path.
+    """
+    from gemini_web2api import server
+    from gemini_web2api.hardened_server import HardenedGeminiHandler
+    from gemini_web2api.phase4_runtime import install_phase4_runtime
+
+    class DummyWFile:
+        def __init__(self):
+            self.data = bytearray()
+
+        def write(self, data):
+            self.data.extend(data)
+
+        def flush(self):
+            pass
+
+    class DummyHandler(HardenedGeminiHandler):
+        pass
+
+    # Production installs the base handler first and the Hardened handler
+    # second. Snapshot every mutated attribute so this integration test is
+    # isolated from the rest of the suite.
+    class_attrs = {}
+    for name in (
+        "send_json",
+        "_handle_anthropic_messages",
+        "do_POST",
+        "_phase4_installed",
+    ):
+        class_attrs[name] = getattr(DummyHandler, name, None)
+
+    module_attrs = {}
+    for name in (
+        "messages_to_prompt",
+        "parse_tool_calls",
+        "generate",
+        "_phase5_generate_wrapped",
+        "_phase5_stream_wrapped",
+        "_phase5_legacy_generate_wrapped",
+    ):
+        module_attrs[name] = getattr(server, name, None)
+
+    original_upload_images = server._upload_images
+    original_generate = server.generate
+
+    try:
+        def fake_generate(*_args, **_kwargs):
+            return (
+                "@@TOOL_CALL@@\n"
+                '{"name":"calculator","arguments":{"a":7,"b":6}}\n'
+                "@@END_TOOL_CALL@@"
+            )
+
+        server.generate = fake_generate
+        server._upload_images = lambda _images: None
+
+        # This mirrors __main__.py.
+        install_phase4_runtime(DummyHandler)
+
+        body = json.dumps({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": "Calculate 7 multiplied by 6."}],
+            "tools": [{
+                "name": "calculator",
+                "description": "Calculate a multiplication.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "number"},
+                        "b": {"type": "number"},
+                    },
+                    "required": ["a", "b"],
+                },
+            }],
+            "tool_choice": {"type": "tool", "name": "calculator"},
+        }).encode()
+
+        handler = DummyHandler.__new__(DummyHandler)
+        handler.wfile = DummyWFile()
+        handler.send_json = lambda data, status=200: setattr(handler, "_captured", (status, data))
+
+        handler._handle_anthropic_messages(body)
+
+        assert getattr(handler, "_captured", (None, None))[0] == 200
+        payload = handler._captured[1]
+        assert payload["stop_reason"] == "tool_use"
+        assert payload["content"][0]["type"] == "tool_use"
+        assert payload["content"][0]["name"] == "calculator"
+        assert payload["content"][0]["input"] == {"a": 7, "b": 6}
+    finally:
+        server._upload_images = original_upload_images
+        server.generate = original_generate
+
+        for name, value in module_attrs.items():
+            if value is None:
+                try:
+                    delattr(server, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(server, name, value)
+
+        for name, value in class_attrs.items():
+            if value is None:
+                try:
+                    delattr(DummyHandler, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(DummyHandler, name, value)
