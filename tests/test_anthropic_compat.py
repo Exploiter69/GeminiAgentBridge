@@ -81,6 +81,9 @@ def test_anthropic_tool_choice_mapping():
     assert anthropic_tool_choice_to_openai("none") == "none"
     assert anthropic_tool_choice_to_openai("required") == "required"
     assert anthropic_tool_choice_to_openai({"type": "any"}) == "required"
+    assert anthropic_tool_choice_to_openai({"type": "required"}) == "required"
+    assert anthropic_tool_choice_to_openai({"type": "auto"}) == "auto"
+    assert anthropic_tool_choice_to_openai({"type": "none"}) == "none"
 
 
 
