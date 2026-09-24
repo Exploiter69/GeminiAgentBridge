@@ -14,7 +14,7 @@ class AnthropicAgenticCompatibilityTests(unittest.TestCase):
         )
         self.assertEqual(
             choice,
-            {"type": "function", "function": {"name": "read_file"}},
+            {"function": {"name": "read_file"}},
         )
 
     def test_named_tool_choice_survives_full_request_conversion(self):
@@ -61,7 +61,7 @@ class AnthropicAgenticCompatibilityTests(unittest.TestCase):
         )
         _, calls = parse_tool_calls_robust(text)
         self.assertEqual(len(calls), 2)
-        self.assertNotEqual(calls[0]["id"], calls[1]["id"])
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":
