@@ -1,3 +1,5 @@
+import json
+
 from gemini_web2api.anthropic_compat import (
     anthropic_messages_to_openai,
     anthropic_response,
@@ -86,7 +88,6 @@ def test_anthropic_tool_choice_mapping():
     assert anthropic_tool_choice_to_openai({"type": "none"}) == "none"
 
 
-
 def test_hardened_handler_dispatches_anthropic_messages():
     from gemini_web2api.hardened_server import HardenedGeminiHandler
 
@@ -100,6 +101,7 @@ def test_hardened_handler_dispatches_anthropic_messages():
     HardenedGeminiHandler.do_POST(handler)
 
     assert calls == [b'{"messages":[{"role":"user","content":"hello"}]}']
+
 
 def test_production_anthropic_tool_choice_survives_phase4_runtime():
     """Exercise the same base+Hardened installation used by __main__."""
