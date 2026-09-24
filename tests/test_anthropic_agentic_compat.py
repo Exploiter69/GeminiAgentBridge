@@ -40,6 +40,59 @@ class AnthropicAgenticCompatibilityTests(unittest.TestCase):
             {"function": {"name": "read_file"}},
         )
 
+    def test_unknown_named_tool_choice_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown tool"):
+            anthropic_messages_to_openai({
+                "messages": [{"role": "user", "content": "use it"}],
+                "tools": [{
+                    "name": "calculator",
+                    "input_schema": {"type": "object"},
+                }],
+                "tool_choice": {"type": "tool", "name": "does_not_exist"},
+            })
+
+    def test_required_without_tools_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "cannot be satisfied"):
+            anthropic_messages_to_openai({
+                "messages": [{"role": "user", "content": "use a tool"}],
+                "tool_choice": {"type": "required"},
+            })
+
+    def test_tool_result_requires_tool_use_id(self):
+        with self.assertRaisesRegex(ValueError, "missing tool_use_id"):
+            anthropic_messages_to_openai({
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "tool_result", "content": "2"}],
+                }],
+            })
+
+    def test_tool_result_must_reference_existing_tool_use(self):
+        with self.assertRaisesRegex(ValueError, "unknown tool_use_id"):
+            anthropic_messages_to_openai({
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_missing",
+                        "content": "2",
+                    }],
+                }],
+            })
+
+    def test_tool_use_requires_id_and_name(self):
+        with self.assertRaisesRegex(ValueError, "missing an id"):
+            anthropic_messages_to_openai({
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "calculator",
+                        "input": {"expression": "1+1"},
+                    }],
+                }],
+            })
+
     def test_unsupported_server_tool_is_not_silently_dropped(self):
         with self.assertRaisesRegex(ValueError, "unsupported Anthropic tool type"):
             anthropic_tools_to_openai([{
