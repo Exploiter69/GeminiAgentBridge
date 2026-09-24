@@ -120,7 +120,7 @@ def test_production_anthropic_tool_choice_survives_phase4_runtime():
     class_attrs = {}
     for cls in (server.GeminiHandler, HardenedGeminiHandler):
         class_attrs[cls] = {
-            name: getattr(cls, name, None)
+            name: (name in cls.__dict__, cls.__dict__.get(name))
             for name in (
                 "send_json",
                 "_handle_anthropic_messages",
@@ -203,11 +203,11 @@ def test_production_anthropic_tool_choice_survives_phase4_runtime():
                 setattr(server, name, value)
 
         for cls, attrs in class_attrs.items():
-            for name, value in attrs.items():
-                if value is None:
+            for name, (existed, value) in attrs.items():
+                if existed:
+                    setattr(cls, name, value)
+                else:
                     try:
                         delattr(cls, name)
                     except AttributeError:
                         pass
-                else:
-                    setattr(cls, name, value)
