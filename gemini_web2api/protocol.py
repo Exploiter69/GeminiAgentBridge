@@ -224,7 +224,13 @@ def validate_tool_calls(tool_calls: list[dict[str, Any]], tool_defs: list[dict[s
 
 
 def tool_choice_name(tool_choice: Any) -> str | None:
-    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            fn = tool_choice.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"].strip():
+                return fn["name"].strip()
+        # Backward-compatible internal representation used by the prompt/runtime
+        # layer. External adapters may use the full OpenAI function-choice shape.
         fn = tool_choice.get("function")
         if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"].strip():
             return fn["name"].strip()
@@ -236,7 +242,10 @@ def validate_tool_choice(tool_choice: Any, tool_defs: list[dict[str, Any]] | Non
         if tool_choice == "required" and not tool_defs:
             return ["tool_choice=required cannot be satisfied without tools"]
         return []
-    if not isinstance(tool_choice, dict) or tool_choice.get("type") != "function":
+    if not isinstance(tool_choice, dict) or (
+        tool_choice.get("type") != "function" and
+        not isinstance(tool_choice.get("function"), dict)
+    ):
         return ["tool_choice must be one of auto, none, required, or a function choice"]
     name = tool_choice_name(tool_choice)
     if not name:
