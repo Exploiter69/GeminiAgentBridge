@@ -120,9 +120,9 @@ class ParsingAndValidationTests(unittest.TestCase):
             '@@TOOL_CALL@@\n{"name":"read_file","arguments":{"path":"a.txt"}}\n@@END_TOOL_CALL@@'
         )
         _, calls = parse_tool_calls_robust(text)
-        self.assertEqual([c["function"]["name"] for c in calls], ["search", "read_file"])
+        self.assertEqual([c["function"]["name"] for c in calls], ["search", "search", "read_file"])
 
-    def test_exact_duplicate_calls_are_deduplicated_without_reordering(self):
+    def test_exact_duplicate_calls_are_preserved_without_reordering(self):
         text = (
             '@@TOOL_CALL@@\n{"name":"search","arguments":{"query":"alpha"}}\n@@END_TOOL_CALL@@\n'
             '@@TOOL_CALL@@\n{"name":"search","arguments":{"query":"alpha"}}\n@@END_TOOL_CALL@@\n'
