@@ -136,6 +136,7 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
     if not text:
         return text or "", []
     calls: list[dict[str, Any]] = []
+    seen: set[str] = set()
     spans: list[tuple[int, int]] = []
     for start, end, raw in _candidate_objects(text):
         obj = _decode_object(raw)
