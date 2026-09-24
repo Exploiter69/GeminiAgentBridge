@@ -92,7 +92,7 @@ def anthropic_tool_choice_to_openai(choice: Any) -> Any:
             return choice
         raise ValueError(f"unsupported Anthropic tool_choice: {choice!r}")
     if isinstance(choice, dict):
-        if choice.get("type") == "any":
+        if choice.get("type") in {"any", "required"}:
             return "required"
         if choice.get("type") == "auto":
             return "auto"
