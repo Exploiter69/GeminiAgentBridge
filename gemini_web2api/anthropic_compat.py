@@ -99,7 +99,7 @@ def anthropic_tool_choice_to_openai(choice: Any) -> Any:
         if choice.get("type") == "none":
             return "none"
         if choice.get("type") == "tool" and choice.get("name"):
-            return {"type": "function", "function": {"name": choice["name"]}}
+            return {"function": {"name": choice["name"]}}
     raise ValueError("unsupported Anthropic tool_choice")
 
 
