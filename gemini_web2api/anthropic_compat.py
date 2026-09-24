@@ -62,15 +62,17 @@ def _anthropic_content_to_openai(content: Any) -> Any:
 
 def anthropic_tools_to_openai(tools: Any) -> list[dict]:
     result = []
-    for tool in tools or []:
+    for index, tool in enumerate(tools or []):
         if not isinstance(tool, dict):
-            continue
-        if tool.get("type") not in (None, "custom"):
-            # Server-side Anthropic tools are intentionally not fabricated.
-            continue
+            raise ValueError(f"unsupported Anthropic tool at index {index}")
+        tool_type = tool.get("type")
+        if tool_type not in (None, "custom"):
+            # Never silently drop a client tool: Claude Code's agent loop
+            # depends on the bridge preserving the complete tool universe.
+            raise ValueError(f"unsupported Anthropic tool type: {tool_type!r}")
         name = tool.get("name")
-        if not name:
-            continue
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Anthropic tool at index {index} is missing a name")
         result.append({
             "type": "function",
             "function": {
@@ -86,7 +88,9 @@ def anthropic_tool_choice_to_openai(choice: Any) -> Any:
     if not choice:
         return "auto"
     if isinstance(choice, str):
-        return choice if choice in {"auto", "none", "required"} else "auto"
+        if choice in {"auto", "none", "required"}:
+            return choice
+        raise ValueError(f"unsupported Anthropic tool_choice: {choice!r}")
     if isinstance(choice, dict):
         if choice.get("type") == "any":
             return "required"
@@ -95,8 +99,8 @@ def anthropic_tool_choice_to_openai(choice: Any) -> Any:
         if choice.get("type") == "none":
             return "none"
         if choice.get("type") == "tool" and choice.get("name"):
-            return {"function": {"name": choice["name"]}}
-    return "auto"
+            return {"type": "function", "function": {"name": choice["name"]}}
+    raise ValueError("unsupported Anthropic tool_choice")
 
 
 def anthropic_messages_to_openai(req: dict[str, Any]) -> tuple[list[dict], list[dict], Any]:
