@@ -55,7 +55,7 @@ def main() -> int:
     parser.add_argument("--ci", action="store_true", help="CI mode: validate all deterministic gates while deferring private live evidence")
     parser.add_argument("--cookie-file", help="local Gemini session file; never printed")
     parser.add_argument("--model", default="gemini-3.6-flash")
-    parser.add_argument("--backend", choices=("legacy", "modern", "auto"), default="legacy")
+    parser.add_argument("--backend", choices=("legacy", "modern", "auto"), default="modern")
     args = parser.parse_args()
 
     if args.live and args.ci:
