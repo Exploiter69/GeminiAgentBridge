@@ -256,6 +256,20 @@ def _sleep_before_retry(policy: RetryPolicy, attempt: int, error: Exception) -> 
         time.sleep(delay)
 
 
+def _is_modern_session_error(error: Exception) -> bool:
+    """Return True for authentication/session failures from the modern client."""
+    text = f"{type(error).__name__} {error}".lower()
+    return any(token in text for token in (
+        "unauthenticated",
+        "permission denied",
+        "forbidden",
+        "unauthorized",
+        "authentication",
+        "session expired",
+        "invalid session",
+    ))
+
+
 def _legacy_file_refs(files: tuple) -> list[str]:
     if not files:
         return []
@@ -321,7 +335,17 @@ def generate(prompt: str, model_id, think_mode=None, file_refs=None, extra_field
     if backend == "legacy":
         return _generate_legacy(request)
     if backend == "modern":
-        return modern_generate_response(request).text
+        try:
+            return modern_generate_response(request).text
+        except Exception as exc:
+            # The original gemini-web2api transport is deliberately retained as
+            # the compatibility fallback. In auto mode, an expired/invalid
+            # modern session must not turn a working legacy StreamGenerate
+            # transport into a completely unusable bridge.
+            if configured_backend == "auto" and _is_modern_session_error(exc):
+                log("Modern Gemini session unavailable; falling back to legacy StreamGenerate")
+                return _generate_legacy(request)
+            raise
     raise ValueError(f"unsupported upstream_backend: {backend}")
 
 
@@ -342,8 +366,15 @@ def generate_stream(prompt: str, model_id, think_mode=None, file_refs=None, extr
         yield from _legacy_stream(request)
         return
     if backend == "modern":
-        yield from modern_generate_stream(request)
-        return
+        try:
+            yield from modern_generate_stream(request)
+            return
+        except Exception as exc:
+            if configured_backend == "auto" and _is_modern_session_error(exc):
+                log("Modern Gemini session unavailable; falling back to legacy StreamGenerate")
+                yield from _legacy_stream(request)
+                return
+            raise
     raise ValueError(f"unsupported upstream_backend: {backend}")
 
 
