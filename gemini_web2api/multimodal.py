@@ -16,11 +16,19 @@ from .config import CONFIG
 from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
 
 
+class UploadedFileRef(str):
+    """String-compatible legacy file reference carrying modern backend bytes."""
+
+    def __new__(cls, reference: str, data: bytes, mime_type: str, filename: str):
+        obj = super().__new__(cls, reference)
+        obj.data = data
+        obj.mime_type = mime_type
+        obj.filename = filename
+        return obj
+
+
 def _get_page_tokens() -> dict:
-    """Fetch WIZ_global_data tokens from Gemini page."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -48,8 +56,8 @@ def _get_page_tokens() -> dict:
             if match:
                 tokens[key] = match.group(1)
         return tokens
-    except Exception as exc:
-        log(f"Page token fetch failed: {type(exc).__name__}")
+    except Exception:
+        log("Page token fetch failed")
         return {}
 
 
@@ -69,7 +77,6 @@ def _cached_page_tokens() -> dict:
 
 
 def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
-    """Infer a common raster image MIME type from its file signature."""
     if not isinstance(image_bytes, bytes):
         return fallback
     if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -94,7 +101,6 @@ def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
 
 
 def _resolve_public_host(hostname: str) -> None:
-    """Reject loopback, private, link-local, multicast and otherwise unsafe targets."""
     if not hostname:
         raise ValueError("image URL has no hostname")
     try:
@@ -114,14 +120,7 @@ def _resolve_public_host(hostname: str) -> None:
     if not addresses:
         raise ValueError("image URL hostname could not be resolved")
     for address in addresses:
-        if (
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
-        ):
+        if address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_reserved or address.is_unspecified:
             raise ValueError("image URL target is not a public address")
 
 
@@ -149,15 +148,21 @@ def _image_opener():
 
 
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
-    """Upload image via Scotty resumable upload. Returns file reference path."""
+    """Upload for legacy transport, or retain bytes for the modern client."""
     max_bytes = int(CONFIG.get("max_image_bytes", 10 * 1024 * 1024))
     if not isinstance(image_bytes, bytes) or len(image_bytes) > max_bytes:
         raise ValueError("image exceeds configured size limit")
 
+    # gemini-webapi accepts local files, so the modern path must not perform a
+    # legacy Gemini upload and then throw the resulting reference away.
+    if str(CONFIG.get("upstream_backend", "modern")).lower() != "legacy":
+        return UploadedFileRef(
+            f"/agentbridge/local/{filename}", image_bytes, mime_type, filename
+        )
+
     tokens = _cached_page_tokens()
     push_id = tokens.get("push_id", "feeds/mcudyrk2a4khkz")
     pctx = tokens.get("pctx", "CgcSBWjK7pYx")
-
     cookie_str, sapisid = load_cookie()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
@@ -191,9 +196,7 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     upload_url = resp.headers.get("X-Goog-Upload-URL") or resp.headers.get("x-goog-upload-url")
     if not upload_url:
         raise RuntimeError("Gemini upload session did not return an upload URL")
-    # Upload URLs can contain signed session material; never log the URL.
     log("Upload session started")
-
     upload_headers = {
         "X-Goog-Upload-Command": "upload, finalize",
         "X-Goog-Upload-Offset": "0",
@@ -205,7 +208,6 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
         resp2 = opener.open(req2, timeout=60)
     else:
         resp2 = urllib.request.urlopen(req2, context=ctx, timeout=60)
-
     file_ref = resp2.read().decode("utf-8", errors="replace").strip()
     if not file_ref or not file_ref.startswith("/"):
         raise RuntimeError("Gemini upload returned an invalid file reference")

@@ -6,6 +6,7 @@ from gemini_web2api.config import CONFIG
 from gemini_web2api.hardened_server import HardenedGeminiHandler
 from gemini_web2api.multimodal import _resolve_public_host, _validate_remote_url
 from gemini_web2api.security import RequestBodyTooLarge, validate_bind
+from gemini_web2api import server
 
 
 class SecurityBoundaryTests(unittest.TestCase):
@@ -53,6 +54,46 @@ class SecurityBoundaryTests(unittest.TestCase):
                 handler._read_request_body()
         finally:
             CONFIG["max_request_body_bytes"] = old
+
+    def test_do_post_catchall_never_echoes_or_logs_raw_exception_text(self):
+        # Regression: the legacy GeminiHandler.do_POST outer catch-all used to
+        # log and return str(exc) verbatim to the calling HTTP client. Since
+        # urllib HTTPError/URLError string forms can embed the outgoing
+        # Gemini request URL (which carries the session XSRF token as a query
+        # parameter), any exception reaching this last-resort boundary must
+        # be reported generically, not echoed back. hardened_server.py's
+        # equivalent boundary already does this correctly; this pins the
+        # legacy server.py boundary to the same behavior.
+        handler = object.__new__(server.GeminiHandler)
+        handler.path = "/v1/chat/completions"
+        handler.client_address = ("127.0.0.1", 12345)
+
+        secret = "at=SUPER-SECRET-XSRF-TOKEN-abc123"
+        recorded = {}
+
+        def fake_send_json(data, status=200):
+            recorded["data"] = data
+            recorded["status"] = status
+
+        handler.send_json = fake_send_json
+
+        old_keys = CONFIG.get("api_keys")
+        CONFIG["api_keys"] = []
+        try:
+            with patch.object(server.GeminiHandler, "_read_request_body", side_effect=RuntimeError(f"boom {secret}")), \
+                 patch.object(server, "log") as mock_log:
+                handler.do_POST()
+        finally:
+            CONFIG["api_keys"] = old_keys
+
+        self.assertEqual(recorded["status"], 500)
+        serialized = str(recorded["data"])
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("SUPER-SECRET", serialized)
+
+        logged = " ".join(str(c) for c in mock_log.call_args_list)
+        self.assertNotIn(secret, logged)
+        self.assertNotIn("SUPER-SECRET", logged)
 
 
 if __name__ == "__main__":

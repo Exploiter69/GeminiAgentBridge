@@ -33,13 +33,15 @@ Authenticated Gemini Web session
 
 ## Release-line guarantees
 
-- Modern `gemini-webapi==2.1.1` transport is the default.
+- Modern `gemini-webapi==2.1.1` transport is what `config.example.json` starts on. The package's own built-in default is `auto`, which resolves to `modern` only when the configured cookie file is in modern (`Secure_1PSID`) format, and otherwise resolves to `legacy` — see [docs/live-transport.md](docs/live-transport.md) for the exact rule.
+- Modern model names are resolved against the authenticated account at runtime; the compatibility aliases in this repository are not guarantees that a particular model exists on every account.
 - Default listener is `127.0.0.1`; non-loopback binding requires configured API keys.
 - Request bodies and remote image downloads are bounded.
 - Remote image URLs are restricted to public HTTP(S) targets and redirects are revalidated.
 - Signed/upload URLs and upstream exception details are not exposed in logs or client errors.
 - Gemini Web calls are serialized initially around one long-lived `GeminiClient`; shutdown closes the client before stopping its asyncio loop.
-- Streaming preflights the first upstream delta before committing HTTP 200 and emits a structured terminal stream error after commit instead of a false `[DONE]`.
+- OpenAI-compatible token `usage` fields are omitted because this bridge does not receive authoritative provider token accounting. It never presents character-count estimates as provider usage.
+- Streaming preflights the first upstream delta before committing HTTP 200. If the upstream fails after commitment, the bridge emits a structured `error` SSE event and deliberately does **not** emit `[DONE]` as a success marker.
 - A stream is never retried after output has crossed the backend boundary, preventing duplicated tool-call prefixes.
 - The old `gemini-web2api` command/module name remains only as a compatibility identity; the maintained implementation is the `gemini_web2api` package.
 
@@ -109,11 +111,13 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gemini-3.6-flash",
+    model="<account-visible-model>",
     messages=[{"role": "user", "content": "Explain recursion simply."}],
 )
 print(response.choices[0].message.content)
 ```
+
+Use `GET /v1/models` to discover the models currently visible to the authenticated Gemini Web account. The compatibility aliases remain available for clients that need stable identifiers, but they are resolved by the selected backend and must not be treated as universal upstream model names.
 
 The same base URL is intended for OpenAI-compatible coding agents. See [`docs/clients.md`](docs/clients.md) and the real-client harness at `scripts/phase8_client_compat.py`.
 
@@ -132,9 +136,15 @@ Bridge never executes shell, filesystem, Git, or arbitrary downstream actions.
 
 ## Streaming semantics
 
-Chat Completions and Gemini `streamGenerateContent` use SSE. The bridge waits for the first meaningful upstream delta before committing the HTTP success response. If the upstream fails after commitment, the bridge emits a structured stream-error event and deliberately does **not** emit `[DONE]` as a success marker.
+Chat Completions and Gemini `streamGenerateContent` use SSE. The bridge waits for the first meaningful upstream delta before committing the HTTP success response. If the upstream fails after commitment, the bridge emits a structured `event: error` SSE event and deliberately does **not** emit `[DONE]` as a success marker.
+
+The Responses endpoint uses Responses-style lifecycle events and does not invent token usage. Its current compatibility implementation is buffered upstream: errors occur before the response stream is committed, while chat streaming uses the true upstream iterator.
 
 Client disconnects close the downstream iterator so the modern backend can cancel the upstream asyncio task rather than continuing generation after the agent has gone away.
+
+## Legacy boundary
+
+The original direct `StreamGenerate` transport remains available only when `upstream_backend=legacy` is selected explicitly. `upstream_backend=auto` falls back to legacy only when the maintained modern package is unavailable; ordinary modern authentication, model, protocol, or upstream failures are not silently rerouted to a different transport. Legacy-only numeric `@think=N` semantics are not fabricated by the modern backend.
 
 ## Docker
 
@@ -163,14 +173,14 @@ git diff --check
 Authenticated live transport smoke test (credentials stay on your machine):
 
 ```bash
-python scripts/live_gemini_web_test.py --cookie-file /path/to/gemini-auth.json
+python scripts/live_gemini_web_test.py --cookie-file /path/to/gemini-auth.json --stream
 ```
 
 Real-client validation:
 
 ```bash
-python scripts/phase8_client_compat.py --opencode --live --cookie-file /path/to/gemini-auth.json
-python scripts/phase8_client_compat.py --hermes --live --cookie-file /path/to/gemini-auth.json
+python scripts/phase8_client_compat.py --opencode --live --cookie-file /path/to/gemini-auth.json --model <account-visible-model>
+python scripts/phase8_client_compat.py --hermes --live --cookie-file /path/to/gemini-auth.json --model <account-visible-model>
 ```
 
 Those commands require the corresponding client to already be installed. They use disposable workspaces and never print the cookie file.
@@ -184,7 +194,8 @@ Those commands require the corresponding client to already be installed. They us
 | `413` | request body limit |
 | image URL rejected | SSRF/public-address policy |
 | stream ends with an error event and no `[DONE]` | upstream failed after stream commitment |
-| HTTP 405 mentioning `StreamGenerate` | an explicitly legacy transport, not the maintained modern backend |
+| HTTP 405 mentioning `StreamGenerate` | an explicitly selected legacy transport |
+| model rejected as unavailable | model is not visible to the authenticated Gemini Web account |
 | port already in use | another local server process |
 
 When reporting failures, provide status codes, exception **types**, timestamps, and command shape. Never provide cookies, API keys, authorization headers, or session files.

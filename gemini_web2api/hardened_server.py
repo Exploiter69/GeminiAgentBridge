@@ -235,6 +235,8 @@ class HardenedGeminiHandler(GeminiHandler):
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
+            elif self.path == "/v1/messages":
+                self._handle_anthropic_messages(body)
             elif ":streamGenerateContent" in self.path:
                 self._handle_google_generate(body, stream=True)
             elif ":generateContent" in self.path:

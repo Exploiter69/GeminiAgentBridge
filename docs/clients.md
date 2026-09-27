@@ -2,11 +2,11 @@
 
 ## OpenAI-compatible clients
 
-The primary compatibility surface is:
+Primary compatibility surfaces:
 
 ```text
 Base URL: http://127.0.0.1:8081/v1
-Protocol: OpenAI-compatible Chat Completions
+Protocols: Chat Completions + Responses
 ```
 
 Use a configured bridge key when `api_keys` is non-empty.
@@ -26,13 +26,13 @@ Recommended smoke sequence:
 7. Exercise a multi-step task.
 8. Repeat with a fresh Hermes session.
 
-The repository's Phase 8 harness and local evidence cover a deterministic compatibility contract, but a new live Gemini Web transport must be revalidated with the real installed Hermes version before release.
+The repository's Phase 8 harness and historical evidence cover a deterministic compatibility contract, but a changed Gemini Web transport must be revalidated with the real installed Hermes version before release.
 
 ## OpenCode
 
 Use the same OpenAI-compatible base URL and authentication model. OpenCode owns its filesystem and terminal tools; the bridge never receives ownership of those operations.
 
-The Phase 8 real-client evidence recorded 13/13 Hermes and 13/13 OpenCode cases. That evidence remains valid as historical client-compatibility evidence, but it does not by itself prove that the current unreleased transport branch can reach Gemini Web today.
+The historical Phase 8 evidence recorded 13/13 Hermes and 13/13 OpenCode cases. That evidence remains useful as regression evidence, but it does not prove that the current unreleased transport branch can reach Gemini Web today.
 
 ## OpenAI Python SDK
 
@@ -76,14 +76,19 @@ Never replace `YOUR_BRIDGE_KEY` with a real key in documentation or paste the re
 
 ## Gemini CLI
 
-The repository retains Google-compatible endpoint adapters for Gemini CLI compatibility. These are compatibility surfaces, not evidence that the current Gemini Web upstream transport is identical to Google's public Gemini API.
+The repository retains Google-compatible endpoint adapters for Gemini CLI compatibility. These are compatibility surfaces, not evidence that the Gemini Web upstream transport is identical to Google's public Gemini API.
+
+## Model contract
+
+The bridge exposes compatibility IDs such as `gemini-3.6-flash`, but the modern backend resolves the requested name against the authenticated Gemini Web account. A compatibility ID must not be interpreted as proof that a particular upstream model is available to every account. Unknown or unavailable models are rejected by the backend resolver rather than silently mapped to an unrelated model.
 
 ## Client contract
 
 Clients should assume:
 
-- model names are aliases exposed by the bridge;
+- model availability depends on the authenticated Gemini Web account;
 - upstream rate/session failures can occur;
 - tool calls are proposals returned to the client, not bridge-side execution;
-- streaming can surface upstream failures after a stream has begun until the active repair work improves error propagation;
-- `/v1/models` is a protocol-layer health check, not an upstream-generation health check.
+- streaming commits HTTP success only after the first meaningful upstream delta;
+- after stream commitment, upstream failures are emitted as an explicit SSE error event and do not receive a false `[DONE]` success marker;
+- `/v1/models` is a protocol-layer catalog and does not by itself prove upstream generation health.

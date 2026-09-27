@@ -15,6 +15,9 @@
     "https://www.google.com/*",
     "https://google.com/*"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
   "action": {
     "default_title": "GeminiAgentBridge Session Sync",
     "default_popup": "popup.html"
