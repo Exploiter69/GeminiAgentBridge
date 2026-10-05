@@ -136,7 +136,6 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
     if not text:
         return text or "", []
     calls: list[dict[str, Any]] = []
-    seen: set[str] = set()
     spans: list[tuple[int, int]] = []
     for start, end, raw in _candidate_objects(text):
         obj = _decode_object(raw)
@@ -148,9 +147,10 @@ def parse_tool_calls_robust(text: str) -> tuple[str, list[dict[str, Any]]]:
         name, arguments = normalized
         canonical = json.dumps({"name": name, "arguments": arguments}, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         spans.append((start, end))
-        if canonical in seen:
-            continue
-        seen.add(canonical)
+        # Every parsed occurrence is a distinct requested tool invocation.
+        # Identical calls are not redundant: side-effecting tools may
+        # legitimately be invoked twice, and silently deduplicating them
+        # changes the model's requested execution trajectory.
         digest = hashlib.sha256(f"{len(calls)}:{canonical}".encode()).hexdigest()[:12]
         calls.append({"id": f"call_{digest}", "type": "function", "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))}})
     if not spans:
