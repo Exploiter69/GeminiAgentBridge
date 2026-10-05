@@ -6,6 +6,7 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 from types import ModuleType
 
 from .config import CONFIG
@@ -64,6 +65,12 @@ def install_phase4_runtime(handler_cls) -> None:
     original_log_message = getattr(handler_cls, "log_message", None)
     original_chat = getattr(handler_cls, "_handle_chat", None)
     original_responses = getattr(handler_cls, "_handle_responses", None)
+    original_anthropic = getattr(handler_cls, "_handle_anthropic_messages", None)
+    # HardenedGeminiHandler inherits the Anthropic handler from GeminiHandler.
+    # Avoid nesting an already-installed wrapper, which would reset normalized
+    # tool context back to the raw Anthropic wire format.
+    if getattr(original_anthropic, "_phase4_anthropic_wrapper", False):
+        original_anthropic = None
 
     original_generate = getattr(module, "generate", None)
     original_generate_stream = getattr(module, "generate_stream", None)
@@ -137,7 +144,38 @@ def install_phase4_runtime(handler_cls) -> None:
         _set_request(req)
         return original_responses(self, body) if original_responses else None
 
+    def handle_anthropic(self, body):
+        try:
+            req = json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+        except (TypeError, json.JSONDecodeError):
+            req = None
+        if isinstance(req, dict):
+            # The Anthropic adapter translates its tool definitions/choice into
+            # the OpenAI-shaped internal protocol before parsing generated tool
+            # calls. Seed the runtime with that same canonical representation;
+            # otherwise recovery validation would compare OpenAI tool calls
+            # against the raw Anthropic wire format.
+            try:
+                from .anthropic_compat import anthropic_messages_to_openai
+                _messages, tools, tool_choice = anthropic_messages_to_openai(req)
+                context_req = dict(req)
+                context_req["tools"] = tools
+                context_req["tool_choice"] = tool_choice
+            except Exception:
+                context_req = req
+        else:
+            context_req = req
+        _set_request(context_req)
+        return original_anthropic(self, body) if original_anthropic else None
+
     def phase4_messages(messages, tools=None, tool_choice=None, *args, **kwargs):
+        # messages_to_prompt is the canonical protocol-normalization boundary.
+        # Keep Phase-4 recovery state synchronized with the exact normalized
+        # values passed into the protocol parser.  Without this, the separate
+        # Phase-4 thread-local state can retain the raw Anthropic tool_choice
+        # while protocol.py has the OpenAI-shaped choice.
+        _state.tool_defs = tools or []
+        _state.tool_choice = tool_choice if tool_choice is not None else "auto"
         return phase4_tools.messages_to_prompt(
             messages,
             tools,
@@ -147,9 +185,25 @@ def install_phase4_runtime(handler_cls) -> None:
         )
 
     def recover_error(exc: BaseException) -> RuntimeError:
+        # Preserve HTTPError so the HTTP boundary can retain upstream
+        # semantics such as 429 + Retry-After instead of turning them into
+        # an indistinguishable 502.
+        if isinstance(exc, urllib.error.HTTPError):
+            failure = classify_exception(exc)
+            module.log(
+                f"Phase5 upstream failure type={failure.error_type.value} "
+                f"retryable={failure.retryable} status={exc.code}"
+            )
+            raise exc
+
         failure = classify_exception(exc)
-        module.log(f"Phase5 upstream failure type={failure.error_type.value} retryable={failure.retryable}")
-        return RuntimeError(f"upstream {failure.error_type.value}: {failure.message}")
+        module.log(
+            f"Phase5 upstream failure type={failure.error_type.value} "
+            f"retryable={failure.retryable}"
+        )
+        return RuntimeError(
+            f"upstream {failure.error_type.value}: {failure.message}"
+        )
 
     def recover_raw(raw):
         failure = classify_upstream_text(raw)
@@ -207,10 +261,15 @@ def install_phase4_runtime(handler_cls) -> None:
     def parse_calls(text: str):
         tool_defs, tool_choice = _current_tool_context()
         clean, calls = parse_tool_calls_robust(text)
-        errors = validate_tool_calls(calls, tool_defs)
+        errors = validate_tool_choice(tool_choice, tool_defs)
+        errors.extend(validate_tool_calls(calls, tool_defs))
         errors.extend(_choice_errors(calls, tool_defs, tool_choice))
         if errors:
-            return clean, calls
+            phase4_tools.clear_tool_context()
+            raise ValueError(
+                "invalid tool call protocol: " + "; ".join(errors[:8])
+            )
+        phase4_tools.clear_tool_context()
         return clean, calls
 
     handler_cls.send_json = send_json
@@ -224,6 +283,10 @@ def install_phase4_runtime(handler_cls) -> None:
         handler_cls._handle_chat = handle_chat
     if original_responses:
         handler_cls._handle_responses = handle_responses
+    if original_anthropic:
+        handle_anthropic._phase4_anthropic_wrapper = True
+
+    handler_cls._handle_anthropic_messages = handle_anthropic
 
     module.messages_to_prompt = phase4_messages
     module.parse_tool_calls = parse_calls

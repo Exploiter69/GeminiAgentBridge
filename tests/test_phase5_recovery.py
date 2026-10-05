@@ -192,6 +192,47 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("required field is missing", calls[1])
 
+    def test_runtime_initializes_context_for_anthropic_messages(self):
+        seen = []
+
+        module_name = "_phase5_anthropic_server"
+        module = types.ModuleType(module_name)
+        module.generate = lambda *_a, **_k: "ok"
+        module.log = lambda _msg: None
+        sys.modules[module_name] = module
+
+        class DummyHandler:
+            __module__ = module_name
+
+            def do_POST(self):
+                return None
+
+            def _handle_anthropic_messages(self, body):
+                seen.append((_state.tool_defs, _state.tool_choice, body))
+                return "handled"
+
+        try:
+            install_phase4_runtime(DummyHandler)
+            handler = DummyHandler()
+            body = b'{"messages":[{"role":"user","content":"hello"}],"tools":[{"name":"calculator"}],"tool_choice":{"type":"tool","name":"calculator"}}'
+            result = handler._handle_anthropic_messages(body)
+            self.assertEqual(result, "handled")
+            self.assertEqual(seen[0][1], {"function": {"name": "calculator"}})
+            self.assertEqual(
+                seen[0][0],
+                [{
+                    "type": "function",
+                    "function": {
+                        "name": "calculator",
+                        "description": "",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }],
+            )
+            self.assertEqual(seen[0][2], body)
+        finally:
+            sys.modules.pop(module_name, None)
+
     def test_runtime_does_not_retry_tool_repair_indefinitely(self):
         calls = []
         invalid = '@@TOOL_CALL@@\n{"name":"read_file","arguments":{}}\n@@END_TOOL_CALL@@'

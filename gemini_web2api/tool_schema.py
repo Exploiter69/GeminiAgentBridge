@@ -1,4 +1,4 @@
-"""Deterministic tool-schema normalization for large agent toolsets."""
+"""Deterministic, semantics-preserving tool-schema normalization."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -8,7 +8,17 @@ from typing import Any
 from .config import CONFIG
 
 _COSMETIC_KEYS = {"title", "$schema", "$id", "examples"}
-_SCHEMA_KEYS = {"type", "description", "properties", "required", "items", "enum", "additionalProperties", "anyOf", "oneOf", "allOf", "const", "pattern", "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems"}
+# Keywords that can change whether an agent-generated argument is accepted must
+# survive compaction. Defaults are also retained because downstream tool
+# executors may rely on them even when the model omits the field.
+_SEMANTIC_KEYS = {
+    "type", "description", "properties", "required", "items", "enum",
+    "additionalProperties", "anyOf", "oneOf", "allOf", "const", "pattern",
+    "minLength", "maxLength", "minimum", "maximum", "exclusiveMinimum",
+    "exclusiveMaximum", "minItems", "maxItems", "uniqueItems", "default",
+    "format", "nullable", "prefixItems", "contains", "minProperties",
+    "maxProperties", "dependentRequired", "dependentSchemas", "not",
+}
 
 
 def _shorten(text: Any, limit: int) -> Any:
@@ -22,17 +32,21 @@ def _normalize_schema(schema: Any, description_limit: int = 220) -> Any:
         return schema
     out: dict[str, Any] = {}
     for key, value in schema.items():
-        if key in _COSMETIC_KEYS or key == "default":
+        if key in _COSMETIC_KEYS:
             continue
         if key == "description":
             out[key] = _shorten(value, description_limit)
         elif key == "properties" and isinstance(value, dict):
             out[key] = {str(name): _normalize_schema(item, description_limit) for name, item in value.items()}
-        elif key in {"items", "additionalProperties"}:
+        elif key in {"items", "additionalProperties", "not", "contains"}:
             out[key] = _normalize_schema(value, description_limit)
-        elif key in {"anyOf", "oneOf", "allOf"} and isinstance(value, list):
+        elif key in {"anyOf", "oneOf", "allOf", "prefixItems"} and isinstance(value, list):
             out[key] = [_normalize_schema(item, description_limit) for item in value]
+        elif key in _SEMANTIC_KEYS:
+            out[key] = deepcopy(value)
         else:
+            # Unknown extension keywords are retained rather than silently
+            # deleting provider-specific semantics.
             out[key] = deepcopy(value)
     return out
 
@@ -57,8 +71,32 @@ def _serialized(tools: list[dict[str, Any]]) -> str:
     return json.dumps(tools, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _drop_cosmetic_metadata(node: Any, description_limit: int = 110) -> Any:
+    if isinstance(node, list):
+        return [_drop_cosmetic_metadata(x, description_limit) for x in node]
+    if not isinstance(node, dict):
+        return node
+    out = {}
+    for key, value in node.items():
+        if key in _COSMETIC_KEYS:
+            continue
+        if key == "description":
+            out[key] = _shorten(value, description_limit)
+        elif key == "properties" and isinstance(value, dict):
+            out[key] = {k: _drop_cosmetic_metadata(v, description_limit) for k, v in value.items()}
+        else:
+            out[key] = _drop_cosmetic_metadata(value, description_limit)
+    return out
+
+
 def normalize_tool_definitions(tools: list[dict[str, Any]] | None, max_chars: int | None = None) -> list[dict[str, Any]]:
-    """Compact tool schemas without deleting callable arguments or tools."""
+    """Compact schemas without deleting callable tools or semantic constraints.
+
+    If the requested budget is too small to represent a tool faithfully, the
+    tool is retained and only descriptive/cosmetic text is shortened. The
+    function never removes required/default/enum/type constraints merely to hit
+    a character budget.
+    """
     canonical: list[dict[str, Any]] = []
     seen: set[str] = set()
     for tool in tools or []:
@@ -74,36 +112,14 @@ def normalize_tool_definitions(tools: list[dict[str, Any]] | None, max_chars: in
     reduced = deepcopy(canonical)
     for tool in reduced:
         tool["description"] = _shorten(tool.get("description", ""), 160)
-
-        def trim_nested(node: Any) -> Any:
-            if isinstance(node, list):
-                return [trim_nested(x) for x in node]
-            if not isinstance(node, dict):
-                return node
-            out = {}
-            for key, value in node.items():
-                if key == "description":
-                    out[key] = _shorten(value, 110)
-                elif key in {"title", "$schema", "$id", "examples", "default"}:
-                    continue
-                elif key == "properties" and isinstance(value, dict):
-                    out[key] = {k: trim_nested(v) for k, v in value.items()}
-                else:
-                    out[key] = trim_nested(value)
-            return out
-
-        tool["parameters"] = trim_nested(tool["parameters"])
-
+        tool["parameters"] = _drop_cosmetic_metadata(tool["parameters"], 110)
     if len(_serialized(reduced)) <= budget:
         return reduced
 
-    final: list[dict[str, Any]] = []
-    for tool in reduced:
-        params = tool.get("parameters") or {}
-        if isinstance(params, dict):
-            params = {k: v for k, v in params.items() if k in _SCHEMA_KEYS}
-        final.append({"name": tool["name"], "description": _shorten(tool.get("description", ""), 80), "parameters": params})
-    return final
+    # A hard budget cannot justify semantic deletion. Return the reduced
+    # representation even if it exceeds the advisory budget; callers can then
+    # explicitly decide whether to reject the request or use a larger context.
+    return reduced
 
 
 def tool_schema_size(tools: list[dict[str, Any]]) -> int:

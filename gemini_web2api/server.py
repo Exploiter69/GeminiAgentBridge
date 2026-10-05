@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 import re
+import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -10,14 +11,10 @@ from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .anthropic_compat import anthropic_messages_to_openai, anthropic_response
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
-
-def _usage(prompt: str, text: str) -> dict:
-    p = len(prompt) // 4
-    c = len(text or "") // 4
-    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
 
 
 def _upload_images(images: list) -> list:
@@ -96,6 +93,84 @@ class GeminiHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
 
+    @staticmethod
+    def _upstream_error_response(exc: Exception) -> tuple[int, dict, dict]:
+        """Map upstream failures to safe HTTP semantics.
+
+        Credentials, response bodies, and upstream payloads are never exposed.
+
+        A tool-call that could not be reconciled with the client's declared
+        schema after a bounded repair attempt (see phase4_runtime.repair_tool_response)
+        is NOT an upstream connectivity failure: Gemini answered successfully,
+        the bridge's own protocol adaptation failed. Collapsing it into the
+        generic "upstream request failed" 502 makes it indistinguishable from a
+        real backend outage to the calling agent, which can cause the agent to
+        treat a recoverable, request-scoped protocol mismatch as a fatal
+        infrastructure fault and abandon the task instead of surfacing/retrying
+        the tool call. Report it as its own client-visible error instead.
+        """
+        message = str(exc)
+        if isinstance(exc, RuntimeError) and message.startswith("tool_call_recovery_failed:"):
+            reason = message.split(":", 1)[1].strip() or "unknown"
+            return (
+                422,
+                {"error": {
+                    "message": (
+                        "the model's tool call could not be reconciled with the "
+                        f"declared tool schema after repair (reason: {reason})"
+                    ),
+                    "type": "tool_call_recovery_failed",
+                    "code": reason,
+                }},
+                {},
+            )
+
+        if isinstance(exc, urllib.error.HTTPError):
+            status = int(exc.code)
+
+            if status == 429:
+                headers = {}
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                if retry_after:
+                    headers["Retry-After"] = retry_after
+                return (
+                    429,
+                    {"error": {
+                        "message": "upstream rate limit",
+                        "type": "rate_limit",
+                    }},
+                    headers,
+                )
+
+            if status in (401, 403):
+                return (
+                    status,
+                    {"error": {
+                        "message": "upstream authentication/session rejected",
+                        "type": "authentication_error",
+                    }},
+                    {},
+                )
+
+            if 500 <= status <= 599:
+                return (
+                    502,
+                    {"error": {
+                        "message": "upstream server error",
+                        "type": "upstream_error",
+                    }},
+                    {},
+                )
+
+        return (
+            502,
+            {"error": {
+                "message": "upstream request failed",
+                "type": "upstream_error",
+            }},
+            {},
+        )
+
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
         if not keys:
@@ -156,6 +231,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
                 self._handle_responses(body)
+            elif self.path == "/v1/messages":
+                self._handle_anthropic_messages(body)
             elif ":streamGenerateContent" in self.path:
                 self._handle_google_generate(body, stream=True)
             elif ":generateContent" in self.path:
@@ -165,10 +242,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            log(f"POST error: {e}")
+            # This is the last-resort boundary for exceptions the inner
+            # handlers did not anticipate (e.g. a bug, or a raw exception
+            # from a helper that isn't itself an upstream-classified
+            # RuntimeError). Every other error path in this file is careful
+            # to redact upstream details (see _upstream_error_response); this
+            # one must be too. str(e) can legitimately contain fragments of
+            # the outgoing Gemini request (URLError/HTTPError string forms
+            # include the request URL, which carries the session XSRF token
+            # as a query parameter), so it must never be logged verbatim or
+            # echoed back to the calling HTTP client.
+            log(f"POST error: {type(e).__name__}")
             try:
-                self.send_json({"error": {"message": str(e)}}, 500)
-            except:
+                self.send_json({"error": {"message": "internal server error"}}, 500)
+            except Exception:
                 pass
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
@@ -228,13 +315,45 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Stream error: {e}")
+                status, payload, headers = self._upstream_error_response(e)
+                # SSE headers are already committed, so preserve the error
+                # semantically inside the stream rather than pretending the
+                # request completed successfully.
+                error = payload.get("error", {})
+                event = {
+                    "error": {
+                        "type": error.get("type", "upstream_error"),
+                        "message": error.get("message", "upstream error"),
+                    }
+                }
+                if status == 429 and "Retry-After" in headers:
+                    event["error"]["retry_after"] = headers["Retry-After"]
+                try:
+                    self.wfile.write(
+                        f"event: error\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                log(
+                    f"Stream error: status={status} "
+                    f"type={error.get('type', 'upstream_error')}"
+                )
             return
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            status, payload, headers = self._upstream_error_response(e)
+            body = json.dumps(payload, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         tool_calls = None
@@ -247,9 +366,49 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._start_sse()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+
+            # Keep OpenAI-compatible streaming semantics explicit. Tool calls
+            # are delivered as deltas and the terminal finish_reason is a
+            # separate chunk so AI SDK/OpenCode can accumulate the call before
+            # advancing the agent loop.
+            def emit_stream_chunk(delta, finish_reason=None):
+                chunk = {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": finish_reason,
+                    }],
+                }
+                self.wfile.write(
+                    f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+                )
+
+            emit_stream_chunk({"role": "assistant"})
+
+            if tool_calls:
+                for index, call in enumerate(tool_calls):
+                    function = call.get("function", {})
+                    emit_stream_chunk({
+                        "tool_calls": [{
+                            "index": index,
+                            "id": call.get("id", f"call_{index}"),
+                            "type": "function",
+                            "function": {
+                                "name": function.get("name", ""),
+                                "arguments": function.get("arguments", "{}"),
+                            },
+                        }]
+                    })
+                emit_stream_chunk({}, "tool_calls")
+            else:
+                if msg.get("content"):
+                    emit_stream_chunk({"content": msg["content"]})
+                emit_stream_chunk({}, "stop")
+
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         else:
@@ -257,9 +416,97 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
-                          "total_tokens": (len(prompt)+len(text or ""))//4},
             })
+
+    # ─── /v1/messages (Anthropic Messages API / Claude Code) ────────────────
+
+    def _handle_anthropic_messages(self, body: bytes):
+        req = self._parse_body(body)
+        if req is None:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON"}}, 400)
+            return
+        if not isinstance(req.get("messages"), list) or not req["messages"]:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": "messages must be a non-empty array"}}, 400)
+            return
+        request_model = str(req.get("model") or "claude-sonnet-4-6")
+        backend_model = CONFIG["default_model"] if request_model.startswith("claude-") else request_model
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(backend_model)
+        if err:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": err}}, 400)
+            return
+
+        try:
+            messages, tools, tool_choice = anthropic_messages_to_openai(req)
+            # Phase-4 runtime has already normalized and seeded the request
+            # context at the Anthropic protocol boundary. Do not overwrite it
+            # here with the raw Anthropic request: that would replace the
+            # canonical OpenAI-shaped tool_choice with {"type":"tool", ...}
+            # immediately before tool-call validation.
+            prompt, images = messages_to_prompt(messages, tools, tool_choice)
+            if not prompt.strip():
+                raise ValueError("empty prompt")
+            file_refs = _upload_images(images)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            tool_calls = None
+            if tools and text and tool_choice != "none":
+                text, tool_calls = parse_tool_calls(text)
+        except ValueError as e:
+            self.send_json({"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}}, 400)
+            return
+        except Exception as e:
+            status, payload, headers = self._upstream_error_response(e)
+            error = payload.get("error", {})
+            self.send_json({"type": "error", "error": {
+                "type": error.get("type", "upstream_error"),
+                "message": error.get("message", "upstream request failed"),
+            }}, status)
+            return
+
+        mid = "msg_" + uuid.uuid4().hex[:24]
+        response = anthropic_response(
+            request_model=request_model,
+            text=text or "",
+            tool_calls=tool_calls,
+            message_id=mid,
+        )
+        if not req.get("stream"):
+            self.send_json(response)
+            return
+
+        self._start_sse()
+        def emit(event_type: str, data: dict):
+            self.wfile.write(("event: " + event_type + "\ndata: " + json.dumps(data, ensure_ascii=False) + "\n\n").encode())
+            self.wfile.flush()
+
+        emit("message_start", {
+            "type": "message_start", "message": {
+                "id": mid, "type": "message", "role": "assistant",
+                "model": request_model, "content": [], "stop_reason": None,
+                "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}
+        }})
+        index = 0
+        if text:
+            emit("content_block_start", {"type": "content_block_start", "index": index,
+                  "content_block": {"type": "text", "text": ""}})
+            emit("content_block_delta", {"type": "content_block_delta", "index": index,
+                  "delta": {"type": "text_delta", "text": text}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": index})
+            index += 1
+        for call in tool_calls or []:
+            fn = call.get("function", {})
+            arguments = fn.get("arguments", "{}")
+            emit("content_block_start", {"type": "content_block_start", "index": index,
+                  "content_block": {"type": "tool_use", "id": call.get("id", "call_" + str(index)),
+                  "name": fn.get("name", ""), "input": {}}})
+            emit("content_block_delta", {"type": "content_block_delta", "index": index,
+                  "delta": {"type": "input_json_delta", "partial_json": arguments}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": index})
+            index += 1
+        emit("message_delta", {"type": "message_delta", "delta": {
+            "stop_reason": "tool_use" if tool_calls else "end_turn",
+            "stop_sequence": None}, "usage": {"output_tokens": 0}})
+        emit("message_stop", {"type": "message_stop"})
+        self.wfile.flush()
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 
@@ -289,6 +536,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     if item.get("type") == "function_call_output":
                         messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
                                          "name": item.get("name", ""), "content": item.get("output", "")})
+                    elif item.get("type") == "function_call":
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": item.get("call_id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", "{}"),
+                                },
+                            }],
+                        })
                     elif item.get("type") in ("input_text", "input_image", "image"):
                         messages.append({"role": "user", "content": [item]})
                     elif item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant"):
@@ -327,7 +587,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
             file_refs = _upload_images(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            status, payload, headers = self._upstream_error_response(e)
+            body = json.dumps(payload, ensure_ascii=False).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         tool_calls = None
@@ -361,11 +630,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode()
                 )
 
-            usage = {
-                "input_tokens": len(prompt) // 4,
-                "output_tokens": len(text or "") // 4,
-                "total_tokens": (len(prompt) + len(text or "")) // 4,
-            }
             base_response = {
                 "id": rid,
                 "object": "response",
@@ -378,7 +642,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     **base_response,
                     "status": "in_progress",
                     "output": [],
-                    "usage": None,
                 },
             )
             emit(
@@ -387,7 +650,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     **base_response,
                     "status": "in_progress",
                     "output": [],
-                    "usage": None,
                 },
             )
             for output_index, item in enumerate(output):
@@ -476,14 +738,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     **base_response,
                     "status": "completed",
                     "output": output,
-                    "usage": usage,
                 },
             )
             self.wfile.flush()
         else:
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output,
-                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
+                            "model": model_name, "output": output})
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
@@ -530,11 +790,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                 final_chunk = {
                     "candidates": [{"finishReason": "STOP", "index": 0}],
-                    "usageMetadata": {
-                        "promptTokenCount": len(prompt) // 4,
-                        "candidatesTokenCount": len(full_text) // 4,
-                        "totalTokenCount": (len(prompt) + len(full_text)) // 4,
-                    },
                     "modelVersion": model_name,
                 }
                 self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
@@ -542,7 +797,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Google stream error: {e}")
+                status, payload, headers = self._upstream_error_response(e)
+                error = payload.get("error", {})
+                event = {
+                    "error": {
+                        "type": error.get("type", "upstream_error"),
+                        "message": error.get("message", "upstream error"),
+                    }
+                }
+                if status == 429 and "Retry-After" in headers:
+                    event["error"]["retry_after"] = headers["Retry-After"]
+                try:
+                    self.wfile.write(
+                        f"event: error\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                log(
+                    f"Google stream error: status={status} "
+                    f"type={error.get('type', 'upstream_error')}"
+                )
             return
 
         try:
@@ -572,14 +847,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "finishReason": "STOP",
             "index": 0,
         }
-        usage = {
-            "promptTokenCount": len(prompt) // 4,
-            "candidatesTokenCount": len(text or "") // 4,
-            "totalTokenCount": (len(prompt) + len(text or "")) // 4,
-        }
         response_obj = {
             "candidates": [candidate],
-            "usageMetadata": usage,
             "modelVersion": model_name,
         }
 

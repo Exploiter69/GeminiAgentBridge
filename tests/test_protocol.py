@@ -27,10 +27,11 @@ class ToolProtocolTests(unittest.TestCase):
         _, calls = parse_tool_calls_robust(text)
         self.assertEqual([c["function"]["name"] for c in calls], ["a", "b"])
 
-    def test_duplicate_call_is_removed(self):
+    def test_duplicate_call_occurrences_are_preserved(self):
         block = '@@TOOL_CALL@@\n{"name":"bash","arguments":{"command":"pwd"}}\n@@END_TOOL_CALL@@'
         clean, calls = parse_tool_calls_robust(block + "\n" + block)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(calls[0]["id"], calls[1]["id"])
         self.assertEqual(clean, "")
 
     def test_string_arguments_are_normalized(self):
